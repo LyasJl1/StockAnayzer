@@ -554,6 +554,56 @@ def parse_custom_tickers(value: str, limit: int = 30) -> list[str]:
     return symbols
 
 
+WATCHLIST_LIMIT = 25
+
+
+def initialize_watchlist() -> None:
+    """Initialise une liste ordonnée depuis l'URL, une seule fois par session."""
+    if "watchlist" not in st.session_state:
+        raw_value = st.query_params.get("watchlist", "")
+        if isinstance(raw_value, list):
+            raw_value = ",".join(str(item) for item in raw_value)
+        st.session_state["watchlist"] = parse_custom_tickers(
+            str(raw_value), limit=WATCHLIST_LIMIT,
+        )
+
+
+def sync_watchlist_query_params() -> None:
+    """Synchronise uniquement le paramètre d'URL appartenant à la watchlist."""
+    value = ",".join(st.session_state.get("watchlist", []))
+    if value:
+        st.query_params["watchlist"] = value
+    elif "watchlist" in st.query_params:
+        del st.query_params["watchlist"]
+
+
+def add_to_watchlist(ticker: str) -> None:
+    """Ajoute un ticker normalisé sans dépasser la limite absolue."""
+    initialize_watchlist()
+    parsed = parse_custom_tickers(ticker, limit=1)
+    if parsed and parsed[0] not in st.session_state["watchlist"]:
+        if len(st.session_state["watchlist"]) >= WATCHLIST_LIMIT:
+            return
+        st.session_state["watchlist"].append(parsed[0])
+        sync_watchlist_query_params()
+
+
+def remove_from_watchlist(ticker: str) -> None:
+    """Retire un ticker de la liste et de l'URL."""
+    initialize_watchlist()
+    symbol = ticker.strip().upper()
+    st.session_state["watchlist"] = [
+        item for item in st.session_state["watchlist"] if item != symbol
+    ]
+    sync_watchlist_query_params()
+
+
+def clear_watchlist() -> None:
+    """Vide la liste après confirmation par l'interface."""
+    st.session_state["watchlist"] = []
+    sync_watchlist_query_params()
+
+
 def _symbols_from_screen_response(response: Any) -> list[str]:
     """Extrait les symboles des différentes enveloppes renvoyées par Yahoo."""
     symbols: list[str] = []
@@ -939,19 +989,26 @@ def render_comparison(left: dict[str, Any], right: dict[str, Any]) -> None:
     st.markdown(f'<div class="card">{escape(build_head_to_head_summary(left, right))}</div>', unsafe_allow_html=True)
 
 
-def open_screener_ticker(ticker: str) -> None:
+def open_analysis_ticker(ticker: str) -> None:
     """Prépare la navigation vers l'analyse détaillée avant le rerun Streamlit."""
     st.session_state["analysis_ticker"] = ticker
     st.session_state["navigation_mode"] = "📊 Analyse"
 
 
-def _format_screener_table(rows: list[dict[str, Any]]) -> pd.DataFrame:
+def open_screener_ticker(ticker: str) -> None:
+    """Conserve le point d'entrée historique du Screener."""
+    open_analysis_ticker(ticker)
+
+
+def _format_screener_table(
+    rows: list[dict[str, Any]], *, include_verdict: bool = False,
+) -> pd.DataFrame:
     """Présente uniquement des chaînes lisibles et jamais les valeurs Python brutes."""
     table = []
     for row in rows:
         currency = CURRENCY_SYMBOLS.get(row["currency"], f"{row['currency']} " if row["currency"] else "")
         mm200 = row.get("mm200")
-        table.append({
+        formatted = {
             "Ticker": row["ticker"], "Société": row["name"],
             "Score": f"{row['global_score']:.0f}", "Confiance": f"{row['confidence']} %",
             "Prix": format_price(row.get("price"), currency),
@@ -964,8 +1021,139 @@ def _format_screener_table(rows: list[dict[str, Any]]) -> pd.DataFrame:
             "MM50": format_percentage(row.get("mm50")),
             "MM200": (f"{'✅' if float(mm200) > 0 else '❌'} {format_percentage(mm200)}"
                       if valid_number(mm200) else "N/D"),
-        })
+        }
+        if include_verdict:
+            formatted = {
+                **dict(list(formatted.items())[:3]),
+                "Verdict": score_verdict(float(row["global_score"])),
+                **dict(list(formatted.items())[3:]),
+            }
+        table.append(formatted)
     return pd.DataFrame(table)
+
+
+def build_watchlist_rows(watchlist: list[str], mode: str) -> list[dict[str, Any]]:
+    """Calcule les lignes via le téléchargement batch et le moteur du Screener."""
+    histories = load_screener_history(tuple(watchlist))
+    rows: list[dict[str, Any]] = []
+    for ticker in watchlist:
+        try:
+            row = build_screener_row(
+                ticker, extract_ticker_history(histories, ticker),
+                load_screener_info(ticker), mode,
+            )
+            if row is not None:
+                rows.append(row)
+        except Exception:
+            continue
+    return rows
+
+
+def render_watchlist(mode: str) -> None:
+    """Affiche, importe, exporte et gère les actions favorites."""
+    st.title("⭐ Ma Watchlist")
+    st.caption("Suivez rapidement vos actions favorites avec le même modèle multifactoriel.")
+    watchlist: list[str] = st.session_state["watchlist"]
+
+    add_col, button_col = st.columns([4, 1])
+    with add_col:
+        manual_ticker = st.text_input(
+            "Ticker à ajouter", placeholder="AAPL, TTE.PA, MSFT…", key="watchlist_manual_ticker",
+        )
+    with button_col:
+        st.write("")
+        add_clicked = st.button("+ Ajouter", key="watchlist_add_manual", use_container_width=True)
+    if add_clicked and manual_ticker.strip():
+        parsed = parse_custom_tickers(manual_ticker, limit=1)
+        if parsed and parsed[0] in watchlist:
+            st.info("Cette action est déjà dans votre watchlist.")
+        elif len(watchlist) >= WATCHLIST_LIMIT:
+            st.warning("La watchlist est limitée à 25 actions.")
+        elif parsed:
+            add_to_watchlist(parsed[0])
+            st.rerun()
+
+    with st.expander("Importer une liste de tickers"):
+        uploaded = st.file_uploader("Fichier CSV", type=["csv"], key="watchlist_import")
+        if uploaded is not None and st.button("Importer", key="watchlist_import_button"):
+            try:
+                imported = pd.read_csv(uploaded)
+                ticker_column = next(
+                    (column for column in imported.columns if str(column).strip().lower() == "ticker"), None,
+                )
+                if ticker_column is None:
+                    st.error("Le CSV doit contenir une colonne Ticker.")
+                else:
+                    candidates = parse_custom_tickers(
+                        " ".join(imported[ticker_column].dropna().astype(str)), limit=WATCHLIST_LIMIT,
+                    )
+                    available = WATCHLIST_LIMIT - len(watchlist)
+                    new_candidates = [item for item in candidates if item not in watchlist]
+                    additions = new_candidates[:available]
+                    for ticker in additions:
+                        add_to_watchlist(ticker)
+                    if len(new_candidates) > available:
+                        st.warning("La watchlist est limitée à 25 actions.")
+                    if additions:
+                        st.rerun()
+                    else:
+                        st.info("Aucune nouvelle action à importer.")
+            except Exception:
+                st.error("Impossible de lire ce CSV. Vérifiez son format.")
+
+    if not watchlist:
+        st.markdown(
+            '<div class="card"><h3>Votre watchlist est vide.</h3>'
+            '<p class="muted">Ajoutez une action depuis l’analyse, le Screener ou avec le champ ci-dessus.</p></div>',
+            unsafe_allow_html=True,
+        )
+        st.caption("Les scores et données sont fournis à titre informatif et peuvent être incomplets ou différés. Ils ne constituent pas une recommandation d'investissement.")
+        return
+
+    signature = (tuple(watchlist), mode)
+    refresh = st.button("🔄 Actualiser la Watchlist", key="watchlist_refresh")
+    if refresh or st.session_state.get("watchlist_signature") != signature:
+        with st.spinner("Actualisation de la Watchlist…"):
+            st.session_state["watchlist_rows"] = build_watchlist_rows(watchlist, mode)
+        st.session_state["watchlist_signature"] = signature
+    rows = st.session_state.get("watchlist_rows", [])
+    sorted_rows = sorted(
+        rows, key=lambda row: float(row["global_score"]) if valid_number(row.get("global_score")) else -1,
+        reverse=True,
+    )
+    scores = [float(row["global_score"]) for row in rows if valid_number(row.get("global_score"))]
+    metrics = st.columns(3)
+    metrics[0].metric("Actions suivies", len(watchlist))
+    metrics[1].metric("Score moyen", f"{sum(scores) / len(scores):.0f}/100" if scores else "N/D")
+    metrics[2].metric("Meilleur score", f"{max(scores):.0f}/100" if scores else "N/D")
+    if sorted_rows:
+        table = _format_screener_table(sorted_rows, include_verdict=True)
+        st.dataframe(table, hide_index=True, use_container_width=True)
+        st.download_button(
+            "⬇️ Exporter en CSV", table.to_csv(index=False).encode("utf-8-sig"),
+            file_name="watchlist.csv", mime="text/csv", key="watchlist_export",
+        )
+    else:
+        st.info("Aucune donnée valide n'est actuellement disponible pour les actions suivies.")
+
+    st.subheader("📊 Ouvrir une action")
+    selected = st.selectbox("Action à analyser", watchlist, key="watchlist_open_ticker")
+    st.button(
+        "Analyser cette action", key="watchlist_open_button",
+        on_click=open_analysis_ticker, args=(selected,),
+    )
+    st.subheader("Gérer la Watchlist")
+    to_remove = st.selectbox("Action à retirer", watchlist, key="watchlist_remove_ticker")
+    if st.button("🗑️ Retirer", key="watchlist_remove_button"):
+        remove_from_watchlist(to_remove)
+        st.rerun()
+    confirm_clear = st.checkbox(
+        "Je confirme vouloir vider la watchlist", key="watchlist_confirm_clear",
+    )
+    if confirm_clear and st.button("🗑️ Vider la Watchlist", key="watchlist_clear_button"):
+        clear_watchlist()
+        st.rerun()
+    st.caption("Les scores et données sont fournis à titre informatif et peuvent être incomplets ou différés. Ils ne constituent pas une recommandation d'investissement.")
 
 
 def render_screener(mode: str) -> None:
@@ -1047,6 +1235,14 @@ def render_screener(mode: str) -> None:
         "Analyser cette action", key="screener_open_button",
         on_click=open_screener_ticker, args=(selected,),
     )
+    if selected in st.session_state["watchlist"]:
+        st.info("⭐ Cette action est déjà dans votre watchlist.")
+    elif st.button("⭐ Ajouter cette action à ma watchlist", key="screener_add_watchlist"):
+        if len(st.session_state["watchlist"]) >= WATCHLIST_LIMIT:
+            st.warning("La watchlist est limitée à 25 actions.")
+        else:
+            add_to_watchlist(selected)
+            st.rerun()
 
 
 def render_dashboard(ticker: str, period: str, mode: str) -> None:
@@ -1098,6 +1294,19 @@ def render_dashboard(ticker: str, period: str, mode: str) -> None:
     metrics[3].metric("Croissance CA YoY", format_percentage(info.get("revenueGrowth")))
     metrics[4].metric("MM50", format_price(mm50, currency), f"Cours {format_percentage(distance_mm50)}")
     metrics[5].metric("MM200", format_price(mm200, currency), f"Cours {format_percentage(distance_mm200)}")
+
+    if ticker in st.session_state["watchlist"]:
+        watch_col, remove_col = st.columns([3, 1])
+        watch_col.info("⭐ Dans ma watchlist")
+        if remove_col.button("Retirer de la watchlist", key=f"analysis_watchlist_remove_{ticker}"):
+            remove_from_watchlist(ticker)
+            st.rerun()
+    elif st.button("⭐ Ajouter à ma watchlist", key=f"analysis_watchlist_add_{ticker}"):
+        if len(st.session_state["watchlist"]) >= WATCHLIST_LIMIT:
+            st.warning("La watchlist est limitée à 25 actions.")
+        else:
+            add_to_watchlist(ticker)
+            st.rerun()
 
     left, right = st.columns([1, 1.4])
     with left:
@@ -1189,13 +1398,14 @@ def render_dashboard(ticker: str, period: str, mode: str) -> None:
 
 
 apply_styles()
+initialize_watchlist()
 if "navigation_mode" not in st.session_state:
     st.session_state["navigation_mode"] = "📊 Analyse"
 if "analysis_ticker" not in st.session_state:
     st.session_state["analysis_ticker"] = "AAPL"
 with st.sidebar:
     navigation = st.radio(
-        "Mode", options=["📊 Analyse", "🥊 Comparateur", "🔎 Screener"],
+        "Mode", options=["📊 Analyse", "🥊 Comparateur", "🔎 Screener", "⭐ Watchlist"],
         key="navigation_mode",
     )
     st.header("Paramètres d'analyse")
@@ -1238,5 +1448,7 @@ elif navigation == "🥊 Comparateur":
                 snapshots.append(None)
         if all(snapshots):
             render_comparison(snapshots[0], snapshots[1])
-else:
+elif navigation == "🔎 Screener":
     render_screener(selected_mode)
+else:
+    render_watchlist(selected_mode)
