@@ -18,3 +18,7 @@ jobs:
         run: |
           ! grep -nE '^(<<<<<<<|=======|>>>>>>>)' app.py
           ! grep -nF '(&gt; 10 %) et le P/E' app.py
+          ! grep -nF '<div class="analysis-grid">' app.py
+          ! grep -nF 'TENDANCE HAUSSIÈRE' app.py
+          test "$(grep -c 'Plan de Trading Suggéré' app.py)" -eq 1
+          test "$(grep -c 'Risque / récompense' app.py)" -eq 1

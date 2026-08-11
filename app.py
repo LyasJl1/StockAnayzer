@@ -431,6 +431,51 @@ def render_dashboard(symbol: str, period: str, mode: str) -> None:
     stop = t["price"] * .93; target = t["price"] * 1.15; ratio = (target - t["price"]) / (t["price"] - stop)
     tech_text = "Le cours évolue au-dessus de ses MM50 et MM200." if valid_number(t["mm50"]) and valid_number(t["mm200"]) and t["price"] > t["mm50"] > t["mm200"] else "La structure MM50/MM200 ne confirme pas une tendance haussière complète."
     if valid_number(t["rsi"]) and t["rsi"] > 70: tech_text += " Le RSI élevé signale une zone de surachat."
+    left, right = st.columns(2, gap="small")
+    with left:
+        st.markdown(
+            f"""
+            <div class="card">
+                <h3>Lecture technique</h3>
+                <p>{tech_text}</p>
+                <div class="trade-row"><span>MM50 ⓘ</span><span class="value">
+                    {format_price(t["mm50"], f["currency"])}
+                    ({format_percentage(t["gap_mm50"], True)})</span></div>
+                <div class="trade-row"><span>MM200 ⓘ</span><span class="value warn">
+                    {format_price(t["mm200"], f["currency"])}
+                    ({format_percentage(t["gap_mm200"], True)})</span></div>
+                <div class="trade-row"><span>RSI 14 ⓘ</span>
+                    <span class="value">{format_number(t["rsi"])}</span></div>
+                <div class="trade-row"><span>MACD / signal ⓘ</span><span class="value">
+                    {format_number(t["macd"], 2)} / {format_number(t["macd_signal"], 2)}</span></div>
+                <div class="trade-row"><span>Plus haut / bas 52 sem.</span><span class="value">
+                    {format_price(t["high52"], f["currency"])} /
+                    {format_price(t["low52"], f["currency"])}</span></div>
+                <div class="trade-row"><span>Volatilité annualisée ⓘ</span>
+                    <span class="value">{format_percentage(t["volatility"])}</span></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with right:
+        st.markdown(
+            f"""
+            <div class="card">
+                <h3>Plan de Trading Suggéré</h3>
+                <div class="trade-row"><span>Entrée théorique</span>
+                    <span class="value">{format_price(t["price"], f["currency"])}</span></div>
+                <div class="trade-row"><span>Stop-Loss (-7 %)</span>
+                    <span class="value bad">{format_price(stop, f["currency"])}</span></div>
+                <div class="trade-row"><span>Take-Profit (+15 %)</span>
+                    <span class="value good">{format_price(target, f["currency"])}</span></div>
+                <div class="trade-row"><span>Risque / récompense</span>
+                    <span class="value good">1 : {ratio:.2f}</span></div>
+                <p class="compact muted">Niveaux mécaniques indicatifs, sans prise en compte
+                    de votre profil ni des frais.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
     cards = st.columns(2)
     with cards[0]:
         st.markdown(f'<div class="card"><h3>Lecture technique</h3><p>{tech_text}</p><div class="trade-row"><span>MM50 ⓘ</span><span class="value">{format_price(t["mm50"],f["currency"])} ({format_percentage(t["gap_mm50"],True)})</span></div><div class="trade-row"><span>MM200 ⓘ</span><span class="value warn">{format_price(t["mm200"],f["currency"])} ({format_percentage(t["gap_mm200"],True)})</span></div><div class="trade-row"><span>RSI 14 ⓘ</span><span class="value">{format_number(t["rsi"])}</span></div><div class="trade-row"><span>MACD / signal ⓘ</span><span class="value">{format_number(t["macd"],2)} / {format_number(t["macd_signal"],2)}</span></div><div class="trade-row"><span>Plus haut / bas 52 sem.</span><span class="value">{format_price(t["high52"],f["currency"])} / {format_price(t["low52"],f["currency"])}</span></div><div class="trade-row"><span>Volatilité annualisée ⓘ</span><span class="value">{format_percentage(t["volatility"])}</span></div></div>', unsafe_allow_html=True)
