@@ -13,6 +13,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+from yfinance import EquityQuery
 from google import genai
 
 
@@ -534,6 +535,178 @@ def score_analysis(data: pd.DataFrame, info: dict[str, Any], mode: str) -> tuple
     return scores, favorable, unfavorable
 
 
+SCREENER_SECTORS = (
+    "Tous", "Technology", "Financial Services", "Healthcare", "Industrials", "Energy",
+    "Consumer Cyclical", "Consumer Defensive", "Communication Services", "Basic Materials",
+    "Real Estate", "Utilities",
+)
+
+
+def parse_custom_tickers(value: str, limit: int = 30) -> list[str]:
+    """Normalise une liste libre de symboles, en conservant leur ordre."""
+    symbols: list[str] = []
+    for candidate in value.replace(",", " ").split():
+        symbol = candidate.strip().upper()
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+        if len(symbols) >= limit:
+            break
+    return symbols
+
+
+def _symbols_from_screen_response(response: Any) -> list[str]:
+    """Extrait les symboles des différentes enveloppes renvoyées par Yahoo."""
+    symbols: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            symbol = value.get("symbol") or value.get("ticker")
+            if isinstance(symbol, str) and symbol.strip():
+                normalised = symbol.strip().upper()
+                if normalised not in symbols:
+                    symbols.append(normalised)
+            for key in ("quotes", "results", "finance", "data"):
+                if key in value:
+                    visit(value[key])
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item)
+
+    visit(response)
+    return symbols
+
+
+def discover_screener_candidates(region: str, sector: str | None, max_candidates: int) -> list[str]:
+    """Découvre au plus 40 grandes/moyennes capitalisations via Yahoo Finance."""
+    size = max(1, min(int(max_candidates), 40))
+    try:
+        conditions = [
+            EquityQuery("eq", ["region", region]),
+            EquityQuery("gte", ["intradaymarketcap", 500_000_000]),
+        ]
+        if sector:
+            conditions.append(EquityQuery("eq", ["sector", sector]))
+        response = yf.screen(
+            EquityQuery("and", conditions), size=size,
+            sortField="intradaymarketcap", sortAsc=False,
+        )
+    except Exception:
+        return []
+    return _symbols_from_screen_response(response)[:size]
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_screener_history(tickers: tuple[str, ...]) -> pd.DataFrame:
+    """Télécharge en une seule requête un an de cours pour les candidats."""
+    if not tickers:
+        return pd.DataFrame()
+    try:
+        history = yf.download(
+            list(tickers), period="1y", interval="1d", group_by="ticker",
+            auto_adjust=False, threads=True, progress=False,
+        )
+    except Exception:
+        return pd.DataFrame()
+    return history if isinstance(history, pd.DataFrame) else pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_screener_info(ticker: str) -> dict[str, Any]:
+    """Charge les fondamentaux d'un candidat présélectionné sans propager d'erreur."""
+    try:
+        info = yf.Ticker(ticker).get_info()
+    except Exception:
+        return {}
+    return info if isinstance(info, dict) else {}
+
+
+def extract_ticker_history(history: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Isole un ticker, quelle que soit l'orientation du MultiIndex yfinance."""
+    if not isinstance(history, pd.DataFrame) or history.empty:
+        return pd.DataFrame()
+    extracted = history
+    if isinstance(history.columns, pd.MultiIndex):
+        extracted = pd.DataFrame()
+        for level in range(history.columns.nlevels):
+            values = history.columns.get_level_values(level).astype(str)
+            matches = [value for value in values.unique() if value.upper() == ticker.upper()]
+            if matches:
+                try:
+                    extracted = history.xs(matches[0], axis=1, level=level, drop_level=True)
+                except (KeyError, TypeError, ValueError):
+                    extracted = pd.DataFrame()
+                break
+    if isinstance(extracted.columns, pd.MultiIndex):
+        extracted.columns = extracted.columns.get_level_values(-1)
+    if "Close" not in extracted.columns:
+        return pd.DataFrame()
+    return extracted.dropna(subset=["Close"]).copy()
+
+
+def build_screener_row(
+    ticker: str, history: pd.DataFrame, info: dict[str, Any], mode: str,
+) -> dict[str, Any] | None:
+    """Construit une ligne en appelant strictement le moteur multifactoriel existant."""
+    if history.empty or "Close" not in history:
+        return None
+    data = calculate_indicators(history)
+    if data.empty:
+        return None
+    current = data["Close"].iloc[-1]
+    if not valid_number(current):
+        return None
+    current = float(current)
+    previous = data["Close"].iloc[-2] if len(data) > 1 else None
+    mm50, mm200 = data["MM50"].iloc[-1], data["MM200"].iloc[-1]
+    rsi = data["RSI"].iloc[-1]
+    volatility = data["Close"].pct_change().dropna().std() * sqrt(252)
+    distance_mm50 = current / float(mm50) - 1 if valid_number(mm50) and float(mm50) else None
+    distance_mm200 = current / float(mm200) - 1 if valid_number(mm200) and float(mm200) else None
+    scores, _, _ = score_analysis(data, info, mode)
+    global_score = sum(scores[key] * WEIGHTS[mode][key] for key in scores) / 100
+    confidence_metrics = (
+        info.get("trailingPE"), info.get("profitMargins"), info.get("revenueGrowth"),
+        info.get("earningsGrowth"), info.get("returnOnEquity"), info.get("freeCashflow"),
+        info.get("priceToBook"), info.get("debtToEquity"), info.get("beta"), volatility,
+        rsi, mm50, mm200,
+    )
+    return {
+        "ticker": ticker,
+        "name": str(info.get("longName") or info.get("shortName") or ticker),
+        "currency": str(info.get("currency") or ""),
+        "global_score": global_score,
+        "confidence": round(sum(valid_number(item) for item in confidence_metrics) / len(confidence_metrics) * 100),
+        "price": current,
+        "daily_change": current / float(previous) - 1 if valid_number(previous) and float(previous) else None,
+        "pe": info.get("trailingPE"), "margin": info.get("profitMargins"),
+        "revenue_growth": info.get("revenueGrowth"), "rsi": rsi,
+        "volatility": volatility, "mm50": distance_mm50, "mm200": distance_mm200,
+        "above_mm200": distance_mm200 is not None and distance_mm200 > 0,
+        "scores": scores,
+    }
+
+
+def filter_screener_results(
+    rows: list[dict[str, Any]], minimum_score: float, maximum_pe: float,
+    ignore_pe: bool, minimum_growth: float, require_mm200: bool, limit: int,
+) -> list[dict[str, Any]]:
+    """Applique les filtres sans convertir les fondamentaux absents en zéro."""
+    selected = []
+    for row in rows:
+        if not valid_number(row.get("global_score")) or float(row["global_score"]) < minimum_score:
+            continue
+        pe = row.get("pe")
+        if not ignore_pe and (not valid_number(pe) or float(pe) <= 0 or float(pe) > maximum_pe):
+            continue
+        growth = row.get("revenue_growth")
+        if not valid_number(growth) or float(growth) < minimum_growth:
+            continue
+        if require_mm200 and (not valid_number(row.get("mm200")) or float(row["mm200"]) <= 0):
+            continue
+        selected.append(row)
+    return sorted(selected, key=lambda item: float(item["global_score"]), reverse=True)[:limit]
+
+
 def render_chart(data: pd.DataFrame, ticker: str) -> None:
     figure = go.Figure()
     figure.add_trace(go.Candlestick(x=data.index, open=data["Open"], high=data["High"], low=data["Low"], close=data["Close"], name=ticker))
@@ -766,6 +939,116 @@ def render_comparison(left: dict[str, Any], right: dict[str, Any]) -> None:
     st.markdown(f'<div class="card">{escape(build_head_to_head_summary(left, right))}</div>', unsafe_allow_html=True)
 
 
+def open_screener_ticker(ticker: str) -> None:
+    """Prépare la navigation vers l'analyse détaillée avant le rerun Streamlit."""
+    st.session_state["analysis_ticker"] = ticker
+    st.session_state["navigation_mode"] = "📊 Analyse"
+
+
+def _format_screener_table(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    """Présente uniquement des chaînes lisibles et jamais les valeurs Python brutes."""
+    table = []
+    for row in rows:
+        currency = CURRENCY_SYMBOLS.get(row["currency"], f"{row['currency']} " if row["currency"] else "")
+        mm200 = row.get("mm200")
+        table.append({
+            "Ticker": row["ticker"], "Société": row["name"],
+            "Score": f"{row['global_score']:.0f}", "Confiance": f"{row['confidence']} %",
+            "Prix": format_price(row.get("price"), currency),
+            "Variation jour": format_percentage(row.get("daily_change")),
+            "P/E": f"{float(row['pe']):.1f}x" if valid_number(row.get("pe")) else "N/D",
+            "Marge nette": format_percentage(row.get("margin")),
+            "Croissance CA": format_percentage(row.get("revenue_growth")),
+            "RSI": f"{float(row['rsi']):.1f}" if valid_number(row.get("rsi")) else "N/D",
+            "Volatilité": format_percentage(row.get("volatility")),
+            "MM50": format_percentage(row.get("mm50")),
+            "MM200": (f"{'✅' if float(mm200) > 0 else '❌'} {format_percentage(mm200)}"
+                      if valid_number(mm200) else "N/D"),
+        })
+    return pd.DataFrame(table)
+
+
+def render_screener(mode: str) -> None:
+    """Affiche les critères, orchestre l'analyse limitée et restitue le classement."""
+    st.title("🔎 Screener d'actions")
+    st.caption("Explorez plusieurs actions avec le même modèle multifactoriel.")
+    market = st.selectbox("Marché", ("🇫🇷 France", "🇺🇸 États-Unis", "✏️ Liste personnalisée"), key="screener_market")
+    custom_value = ""
+    if market == "✏️ Liste personnalisée":
+        custom_value = st.text_area(
+            "Tickers (30 maximum)", placeholder="AAPL, MSFT, NVDA, TTE.PA, SHEL",
+            key="screener_custom_tickers",
+        )
+    sector = st.selectbox("Secteur", SCREENER_SECTORS, key="screener_sector")
+    candidate_count = st.slider("Nombre d'actions à examiner", 10, 40, 20, key="screener_candidate_count")
+    col1, col2 = st.columns(2)
+    with col1:
+        minimum_score = st.slider("Score minimum", 0, 100, 65, key="screener_minimum_score")
+        maximum_pe = st.slider("P/E maximum", 5, 80, 30, key="screener_maximum_pe")
+        ignore_pe = st.checkbox("Ne pas filtrer sur le P/E", key="screener_ignore_pe")
+    with col2:
+        minimum_growth_percent = st.slider("Croissance CA minimum (%)", -20, 50, 0, key="screener_minimum_growth")
+        require_mm200 = st.checkbox("Cours au-dessus de la MM200", value=False, key="screener_require_mm200")
+        result_limit = st.slider("Nombre maximum de résultats", 5, 25, 15, key="screener_result_limit")
+
+    if st.button("🔎 Rechercher", type="primary", key="screener_search"):
+        if market == "✏️ Liste personnalisée":
+            candidates = parse_custom_tickers(custom_value)[:candidate_count]
+        else:
+            region = "fr" if market == "🇫🇷 France" else "us"
+            with st.spinner("Découverte des actions disponibles sur Yahoo Finance…"):
+                candidates = discover_screener_candidates(
+                    region, None if sector == "Tous" else sector, candidate_count,
+                )
+        if not candidates:
+            st.session_state["screener_run"] = {"examined": 0, "rows": []}
+            st.warning("Yahoo Finance n'a retourné aucun candidat. Vérifiez la liste ou réessayez plus tard.")
+        else:
+            histories = load_screener_history(tuple(candidates))
+            progress = st.progress(0)
+            status = st.empty()
+            rows: list[dict[str, Any]] = []
+            for index, ticker in enumerate(candidates, start=1):
+                status.text(f"Analyse de {index} / {len(candidates)} : {ticker}")
+                try:
+                    ticker_history = extract_ticker_history(histories, ticker)
+                    info = load_screener_info(ticker)
+                    row = build_screener_row(ticker, ticker_history, info, mode)
+                    if row is not None:
+                        rows.append(row)
+                except Exception:
+                    pass
+                progress.progress(index / len(candidates))
+            progress.empty()
+            status.empty()
+            filtered = filter_screener_results(
+                rows, minimum_score, maximum_pe, ignore_pe,
+                minimum_growth_percent / 100, require_mm200, result_limit,
+            )
+            st.session_state["screener_run"] = {"examined": len(candidates), "rows": filtered}
+
+    run = st.session_state.get("screener_run")
+    if run is None:
+        return
+    rows = run["rows"]
+    metrics = st.columns(3)
+    metrics[0].metric("Actions examinées", run["examined"])
+    metrics[1].metric("Actions retenues", len(rows))
+    metrics[2].metric("Meilleur score", f"{rows[0]['global_score']:.0f}/100" if rows else "N/D")
+    st.subheader("Résultats du screener")
+    if not rows:
+        st.info("Aucune action ne correspond actuellement à ces critères. Essayez d'assouplir les filtres.")
+        return
+    st.dataframe(_format_screener_table(rows), hide_index=True, use_container_width=True)
+    st.caption("Ce classement est un outil de filtrage quantitatif basé sur les données disponibles. Il ne constitue pas une recommandation d'investissement.")
+    st.subheader("📊 Ouvrir une action dans l'analyse complète")
+    selected = st.selectbox("Action trouvée", [row["ticker"] for row in rows], key="screener_open_ticker")
+    st.button(
+        "Analyser cette action", key="screener_open_button",
+        on_click=open_screener_ticker, args=(selected,),
+    )
+
+
 def render_dashboard(ticker: str, period: str, mode: str) -> None:
     """Affiche l'unique version du tableau de bord d'analyse."""
     with st.spinner(f"Analyse de {ticker}…"):
@@ -906,16 +1189,25 @@ def render_dashboard(ticker: str, period: str, mode: str) -> None:
 
 
 apply_styles()
+if "navigation_mode" not in st.session_state:
+    st.session_state["navigation_mode"] = "📊 Analyse"
+if "analysis_ticker" not in st.session_state:
+    st.session_state["analysis_ticker"] = "AAPL"
 with st.sidebar:
-    navigation = st.radio("Mode", options=["📊 Analyse", "🥊 Comparateur"])
+    navigation = st.radio(
+        "Mode", options=["📊 Analyse", "🥊 Comparateur", "🔎 Screener"],
+        key="navigation_mode",
+    )
     st.header("Paramètres d'analyse")
     selected_period = st.selectbox("Période", options=list(PERIODS))
     selected_mode = st.radio("Profil", options=list(WEIGHTS))
     if navigation == "📊 Analyse":
-        ticker_input = st.text_input("Ticker", value="AAPL", placeholder="AAPL, MSFT, MC.PA…").strip().upper()
+        ticker_input = st.text_input(
+            "Ticker", placeholder="AAPL, MSFT, MC.PA…", key="analysis_ticker",
+        ).strip().upper()
         analyze = st.button("Analyser", type="primary", use_container_width=True)
         st.caption("Les tickers internationaux nécessitent leur suffixe de place (ex. MC.PA).")
-    else:
+    elif navigation == "🥊 Comparateur":
         ticker_a = st.text_input("Action A", value="TTE.PA").strip().upper()
         ticker_b = st.text_input("Action B", value="SHEL").strip().upper()
         compare = st.button("Comparer", type="primary", use_container_width=True)
@@ -928,7 +1220,7 @@ if navigation == "📊 Analyse":
             render_dashboard(ticker_input, PERIODS[selected_period], selected_mode)
         except Exception as error:
             st.error(f"Impossible d'analyser {ticker_input} : {error}")
-else:
+elif navigation == "🥊 Comparateur":
     st.title("🥊 Comparateur d'actions")
     st.caption("Comparez deux entreprises avec les mêmes critères d'analyse.")
     if compare:
@@ -946,3 +1238,5 @@ else:
                 snapshots.append(None)
         if all(snapshots):
             render_comparison(snapshots[0], snapshots[1])
+else:
+    render_screener(selected_mode)
