@@ -39,6 +39,8 @@ def apply_styles() -> None:
         }
         [data-testid="stMetricValue"] { color: #f8fafc; }
         .company-meta { color: #94a3b8; margin-top: -0.7rem; margin-bottom: 1.3rem; }
+        .analysis-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+                         gap: 12px; align-items: stretch; }
         .analysis-card {
             background: #111c2f; border: 1px solid #25334a; border-radius: 14px;
             padding: 18px; min-height: 370px; box-sizing: border-box;
@@ -72,6 +74,7 @@ def apply_styles() -> None:
                         margin: auto 0 0; }
         .disclaimer { color: #94a3b8; font-size: .82rem; }
         @media (max-width: 768px) {
+            .analysis-grid { grid-template-columns: 1fr; }
             .analysis-card { min-height: auto; padding: 15px; }
             .detail-grid { grid-template-columns: 1fr; }
             .headline-price { font-size: 1.8rem; }
@@ -274,6 +277,11 @@ def render_dashboard(ticker_symbol: str, period: str) -> None:
     )
     ratio_label = f"1 : {risk_reward:.2f}" if valid_number(risk_reward) else "N/A"
 
+    # Un seul appel de rendu contient les deux cartes afin d'éviter qu'un ancien
+    # fragment Streamlit ne réaffiche séparément le ratio ou les titres.
+    st.markdown(
+        f"""
+        <div class="analysis-grid">
     left, right = st.columns(2, gap="small")
     with left:
         st.markdown(
@@ -332,6 +340,10 @@ def render_dashboard(ticker_symbol: str, period: str) -> None:
                 <p class="compact-note">Niveaux mécaniques et indicatifs, sans prise en compte de
                 la volatilité, des frais ni de votre profil de risque.</p>
             </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
             """,
             unsafe_allow_html=True,
         )
