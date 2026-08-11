@@ -286,6 +286,162 @@ def build_summary(
     )
 
 
+def build_comparison_snapshot(ticker: str, period: str, mode: str) -> dict[str, Any]:
+    """Construit une vue standardisée en réutilisant le moteur d'analyse."""
+    history, info = load_stock_data(ticker, period)
+    data = calculate_indicators(history)
+    current = float(data["Close"].iloc[-1])
+    previous = float(data["Close"].iloc[-2]) if len(data) > 1 else None
+    mm50, mm200 = data["MM50"].iloc[-1], data["MM200"].iloc[-1]
+    scores, _, _ = score_analysis(data, info, mode)
+    weights = WEIGHTS[mode]
+    return {
+        "ticker": ticker,
+        "name": str(info.get("longName") or info.get("shortName") or ticker),
+        "exchange": str(info.get("fullExchangeName") or info.get("exchange") or "Place N/D"),
+        "currency": str(info.get("currency") or "Devise N/D"),
+        "price": current,
+        "daily_change": current / previous - 1 if previous else None,
+        "pe": info.get("trailingPE"),
+        "margin": info.get("profitMargins"),
+        "revenue_growth": info.get("revenueGrowth"),
+        "roe": info.get("returnOnEquity"),
+        "price_to_book": info.get("priceToBook"),
+        "rsi": data["RSI"].iloc[-1],
+        "mm50": current / float(mm50) - 1 if valid_number(mm50) and mm50 else None,
+        "mm200": current / float(mm200) - 1 if valid_number(mm200) and mm200 else None,
+        "volatility": data["Close"].pct_change().std() * sqrt(252),
+        "global_score": sum(scores[key] * weights[key] for key in scores) / 100,
+        "scores": scores,
+    }
+
+
+def comparison_winner(metric: str, left: Any, right: Any, tickers: tuple[str, str]) -> str:
+    """Détermine l'avantage selon la nature du critère, sans noter les absences."""
+    if metric == "price":
+        return "—"
+    if not valid_number(left) and not valid_number(right):
+        return "—"
+    if not valid_number(left):
+        return f"🏆 {tickers[1]}"
+    if not valid_number(right):
+        return f"🏆 {tickers[0]}"
+    a, b = float(left), float(right)
+    if metric in {"pe", "price_to_book"}:
+        if a <= 0 and b <= 0:
+            return "—"
+        if a <= 0:
+            return f"🏆 {tickers[1]}"
+        if b <= 0:
+            return f"🏆 {tickers[0]}"
+        better = a < b
+    elif metric == "volatility":
+        better = a < b
+    elif metric == "rsi":
+        a_target, b_target = 40 <= a <= 65, 40 <= b <= 65
+        if a_target and b_target:
+            return "⚖️ Égalité"
+        if a_target != b_target:
+            return f"🏆 {tickers[0] if a_target else tickers[1]}"
+        better = abs(a - 52.5) < abs(b - 52.5)
+    elif metric in {"mm50", "mm200"}:
+        # Une hausse modérée au-dessus de la moyenne est privilégiée ;
+        # les excès et les tendances négatives sont pénalisés.
+        utility = lambda value: -abs(value - 0.08) - (0.15 if value < 0 else 0)
+        better = utility(a) > utility(b)
+    else:
+        better = a > b
+    if abs(a - b) < 1e-12:
+        return "⚖️ Égalité"
+    return f"🏆 {tickers[0] if better else tickers[1]}"
+
+
+def build_head_to_head_summary(left: dict[str, Any], right: dict[str, Any]) -> str:
+    """Produit une synthèse déterministe uniquement avec les mesures disponibles."""
+    tickers = (left["ticker"], right["ticker"])
+    sentences: list[str] = []
+    pe_winner = comparison_winner("pe", left["pe"], right["pe"], tickers)
+    if pe_winner.startswith("🏆"):
+        sentences.append(f"{pe_winner[2:]} ressort mieux valorisée grâce à un P/E positif inférieur")
+    margin_winner = comparison_winner("margin", left["margin"], right["margin"], tickers)
+    if margin_winner.startswith("🏆"):
+        sentences.append(f"{margin_winner[2:]} présente la meilleure marge nette")
+    technical_winner = comparison_winner(
+        "score", left["scores"]["Technique"], right["scores"]["Technique"], tickers
+    )
+    if technical_winner.startswith("🏆"):
+        sentences.append(f"sur le plan technique, {technical_winner[2:]} obtient le meilleur score")
+    score_gap = left["global_score"] - right["global_score"]
+    if abs(score_gap) >= 3:
+        winner = tickers[0] if score_gap > 0 else tickers[1]
+        sentences.append(f"le score global donne actuellement un avantage à {winner}")
+    else:
+        sentences.append("les scores globaux restent très équilibrés")
+    return ". ".join(sentence[0].upper() + sentence[1:] for sentence in sentences) + "."
+
+
+def render_comparison(left: dict[str, Any], right: dict[str, Any]) -> None:
+    """Affiche les cartes et le tableau du comparateur."""
+    card_columns = st.columns([1, 0.18, 1])
+    for column, snapshot in ((card_columns[0], left), (card_columns[2], right)):
+        score = snapshot["global_score"]
+        color = "good" if score >= 70 else ("warn" if score >= 50 else "bad")
+        details = (
+            f"P/E : {float(snapshot['pe']):.1f}x" if valid_number(snapshot["pe"]) else "P/E : N/D"
+        )
+        details += f"<br>Marge nette : {format_percentage(snapshot['margin'])}"
+        details += f"<br>Croissance CA : {format_percentage(snapshot['revenue_growth'])}"
+        details += f"<br>RSI : {float(snapshot['rsi']):.1f}" if valid_number(snapshot["rsi"]) else "<br>RSI : N/D"
+        with column:
+            st.markdown(
+                f'<div class="decision"><h3>{escape(snapshot["name"])}</h3>'
+                f'<div class="meta"><b>{escape(snapshot["ticker"])} · {escape(snapshot["exchange"])} · {escape(snapshot["currency"])}</b></div>'
+                f'<div class="score {color}">{score:.0f}<span style="font-size:1rem"> / 100</span></div>'
+                f'<p>{details}</p></div>', unsafe_allow_html=True,
+            )
+    card_columns[1].markdown("<h2 style='text-align:center;padding-top:5rem'>VS</h2>", unsafe_allow_html=True)
+    gap = left["global_score"] - right["global_score"]
+    if abs(gap) >= 3:
+        st.subheader(f"🏆 Avantage global : {left['ticker'] if gap > 0 else right['ticker']}")
+    else:
+        st.subheader("⚖️ Comparaison très équilibrée")
+    st.caption("Le score global est un outil de comparaison multifactorielle et ne constitue pas une recommandation d'investissement.")
+
+    def ratio(value: Any) -> str:
+        return f"{float(value):.1f}x" if valid_number(value) else "N/D"
+
+    rows = [
+        ("Score global", "global_score", left["global_score"], right["global_score"], lambda v: f"{v:.0f}/100"),
+        ("Prix actuel", "price", left["price"], right["price"], format_price),
+        ("Variation journalière", "daily_change", left["daily_change"], right["daily_change"], format_percentage),
+        ("P/E", "pe", left["pe"], right["pe"], ratio),
+        ("Marge nette", "margin", left["margin"], right["margin"], format_percentage),
+        ("Croissance CA", "revenue_growth", left["revenue_growth"], right["revenue_growth"], format_percentage),
+        ("ROE", "roe", left["roe"], right["roe"], format_percentage),
+        ("Price / Book", "price_to_book", left["price_to_book"], right["price_to_book"], ratio),
+        ("RSI 14", "rsi", left["rsi"], right["rsi"], lambda v: f"{float(v):.1f}" if valid_number(v) else "N/D"),
+        ("Volatilité annualisée", "volatility", left["volatility"], right["volatility"], format_percentage),
+        ("Distance à MM50", "mm50", left["mm50"], right["mm50"], format_percentage),
+        ("Distance à MM200", "mm200", left["mm200"], right["mm200"], format_percentage),
+    ]
+    for score_name in WEIGHTS[next(iter(WEIGHTS))]:
+        rows.append((f"Score {score_name}", "score", left["scores"][score_name], right["scores"][score_name], lambda v: f"{v:.0f}/100"))
+    table = []
+    for label, key, a, b, formatter in rows:
+        if key == "price":
+            left_text = formatter(a, CURRENCY_SYMBOLS.get(left["currency"], f"{left['currency']} "))
+            right_text = formatter(b, CURRENCY_SYMBOLS.get(right["currency"], f"{right['currency']} "))
+        else:
+            left_text, right_text = formatter(a), formatter(b)
+        table.append({
+            "Critère": label, "Action A": left_text, "Action B": right_text,
+            "Avantage": comparison_winner(key, a, b, (left["ticker"], right["ticker"])),
+        })
+    st.dataframe(pd.DataFrame(table), hide_index=True, use_container_width=True)
+    st.subheader("Résumé du face-à-face")
+    st.markdown(f'<div class="card">{escape(build_head_to_head_summary(left, right))}</div>', unsafe_allow_html=True)
+
+
 def render_dashboard(ticker: str, period: str, mode: str) -> None:
     """Affiche l'unique version du tableau de bord d'analyse."""
     with st.spinner(f"Analyse de {ticker}…"):
@@ -417,17 +573,42 @@ def render_dashboard(ticker: str, period: str, mode: str) -> None:
 
 apply_styles()
 with st.sidebar:
+    navigation = st.radio("Mode", options=["📊 Analyse", "🥊 Comparateur"])
     st.header("Paramètres d'analyse")
-    ticker_input = st.text_input("Ticker", value="AAPL", placeholder="AAPL, MSFT, MC.PA…").strip().upper()
     selected_period = st.selectbox("Période", options=list(PERIODS))
     selected_mode = st.radio("Profil", options=list(WEIGHTS))
-    analyze = st.button("Analyser", type="primary", use_container_width=True)
-    st.caption("Les tickers internationaux nécessitent leur suffixe de place (ex. MC.PA).")
+    if navigation == "📊 Analyse":
+        ticker_input = st.text_input("Ticker", value="AAPL", placeholder="AAPL, MSFT, MC.PA…").strip().upper()
+        analyze = st.button("Analyser", type="primary", use_container_width=True)
+        st.caption("Les tickers internationaux nécessitent leur suffixe de place (ex. MC.PA).")
+    else:
+        ticker_a = st.text_input("Action A", value="TTE.PA").strip().upper()
+        ticker_b = st.text_input("Action B", value="SHEL").strip().upper()
+        compare = st.button("Comparer", type="primary", use_container_width=True)
 
-if not ticker_input:
-    st.info("Saisissez un ticker dans la barre latérale.")
-elif analyze or ticker_input:
-    try:
-        render_dashboard(ticker_input, PERIODS[selected_period], selected_mode)
-    except Exception as error:
-        st.error(f"Impossible d'analyser {ticker_input} : {error}")
+if navigation == "📊 Analyse":
+    if not ticker_input:
+        st.info("Saisissez un ticker dans la barre latérale.")
+    elif analyze or ticker_input:
+        try:
+            render_dashboard(ticker_input, PERIODS[selected_period], selected_mode)
+        except Exception as error:
+            st.error(f"Impossible d'analyser {ticker_input} : {error}")
+else:
+    st.title("🥊 Comparateur d'actions")
+    st.caption("Comparez deux entreprises avec les mêmes critères d'analyse.")
+    if compare:
+        snapshots: list[dict[str, Any] | None] = []
+        for label, ticker in (("Action A", ticker_a), ("Action B", ticker_b)):
+            if not ticker:
+                st.error(f"{label} : saisissez un ticker.")
+                snapshots.append(None)
+                continue
+            try:
+                with st.spinner(f"Chargement de {ticker}…"):
+                    snapshots.append(build_comparison_snapshot(ticker, PERIODS[selected_period], selected_mode))
+            except Exception as error:
+                st.error(f"Impossible de charger {label} ({ticker}) : {error}")
+                snapshots.append(None)
+        if all(snapshots):
+            render_comparison(snapshots[0], snapshots[1])
