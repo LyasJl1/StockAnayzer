@@ -303,6 +303,7 @@ def build_ai_snapshot(
     distance_mm200: float | None,
     position_52w: float | None,
     events: dict[str, Any],
+    timing: dict[str, Any],
 ) -> dict[str, Any]:
     """Construit l'instantané IA uniquement avec les métriques déjà calculées."""
 
@@ -354,6 +355,17 @@ def build_ai_snapshot(
             "rendement_dividende_ratio": events.get("dividend_yield"),
             "date_ex_dividende": events.get("ex_dividend_date"),
         }),
+        "timing_entree": {
+            "score_sur_100": timing.get("score") if valid_number(timing.get("score")) else "N/D",
+            "confiance_pourcent": timing.get("confidence"),
+            "verdict": timing.get("verdict"),
+            "sous_scores_sur_100": available(timing.get("categories", {})),
+            "conditions_validees": timing.get("confirmed_conditions"),
+            "conditions_disponibles": timing.get("available_conditions"),
+            "support_recent": timing.get("support"),
+            "resistance_recente": timing.get("resistance"),
+            "ATR_pourcent_du_cours": timing.get("atr_percent"),
+        },
     }
     return {key: value for key, value in snapshot.items() if value not in ({}, None, "")}
 
@@ -369,14 +381,16 @@ Analyse UNIQUEMENT les métriques fournies ci-dessous. Tu n'as pas le droit :
 - de prédire avec certitude l'évolution du cours
 - de dire « achetez », « vendez », « il faut acheter » ou « il faut vendre »
 - de présenter cette analyse comme un conseil financier
+- de transformer le Timing en conseil financier ou de dire « achète maintenant »
+- de promettre une hausse ou d'inventer un niveau de prix
 
 Réponds en français. Produis exactement 3 points courts :
 ✅ Point rassurant : explique la principale force visible dans les données.
 ⚠️ Point d'attention : explique le principal risque ou la principale faiblesse visible.
-🧭 Lecture clé : explique comment interpréter l'ensemble de manière équilibrée.
+🧭 Lecture du timing : explique la convergence actuelle sans donner d'ordre.
 
 Chaque point doit citer au moins une métrique réelle fournie lorsqu'une métrique
-pertinente est disponible. Maximum environ 80 mots au total. Si certaines données
+pertinente est disponible. Maximum environ 100 mots au total. Si certaines données
 sont manquantes, ignore-les. Ne les invente jamais.
 
 Données :
@@ -467,6 +481,317 @@ def calculate_indicators(history: pd.DataFrame) -> pd.DataFrame:
     data["MACD"] = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
     data["Signal"] = data["MACD"].ewm(span=9, adjust=False).mean()
     return data
+
+
+def calculate_atr(data: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Calcule l'ATR de Wilder sans altérer les indicateurs historiques."""
+    if not {"High", "Low", "Close"}.issubset(data.columns) or data.empty:
+        return pd.Series(index=data.index, dtype=float, name=f"ATR{period}")
+    previous_close = data["Close"].shift(1)
+    true_range = pd.concat(
+        [data["High"] - data["Low"], (data["High"] - previous_close).abs(),
+         (data["Low"] - previous_close).abs()], axis=1,
+    ).max(axis=1)
+    atr = true_range.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    atr.name = f"ATR{period}"
+    return atr.where(atr > 0)
+
+
+def calculate_price_zones(data: pd.DataFrame, atr: float | None) -> dict[str, Any]:
+    """Repère les pivots proches sur 60 séances, sans extrapoler de niveau."""
+    result: dict[str, Any] = {"support": None, "resistance": None,
+                              "support_zone": None, "resistance_zone": None}
+    if data.empty or not {"Close", "High", "Low"}.issubset(data.columns):
+        return result
+    recent = data.tail(60)
+    current = recent["Close"].iloc[-1]
+    if not valid_number(current) or len(recent) < 5:
+        return result
+    current = float(current)
+    lows, highs = recent["Low"], recent["High"]
+    pivot_lows = [float(lows.iloc[i]) for i in range(2, len(recent) - 2)
+                  if valid_number(lows.iloc[i]) and lows.iloc[i] < lows.iloc[i-2:i].min()
+                  and lows.iloc[i] < lows.iloc[i+1:i+3].min() and lows.iloc[i] < current]
+    pivot_highs = [float(highs.iloc[i]) for i in range(2, len(recent) - 2)
+                   if valid_number(highs.iloc[i]) and highs.iloc[i] > highs.iloc[i-2:i].max()
+                   and highs.iloc[i] > highs.iloc[i+1:i+3].max() and highs.iloc[i] > current]
+    support = max(pivot_lows) if pivot_lows else None
+    resistance = min(pivot_highs) if pivot_highs else None
+    if support is None:
+        candidate = recent["Low"].dropna().min()
+        support = float(candidate) if valid_number(candidate) and candidate < current else None
+    if resistance is None:
+        candidate = recent["High"].dropna().max()
+        resistance = float(candidate) if valid_number(candidate) and candidate > current else None
+    result.update({"support": support, "resistance": resistance})
+    width = float(atr) * .25 if valid_number(atr) and float(atr) > 0 else None
+    if support is not None:
+        result["support_zone"] = (support - width, support + width) if width else (support, support)
+    if resistance is not None:
+        result["resistance_zone"] = (resistance - width, resistance + width) if width else (resistance, resistance)
+    return result
+
+
+def timing_verdict(score: float | None) -> str:
+    if score is None:
+        return "⚪ Timing non déterminable"
+    if score >= 80:
+        return "🟢 Conditions très favorables"
+    if score >= 70:
+        return "🟢 Conditions favorables"
+    if score >= 55:
+        return "🟠 Attendre une confirmation"
+    if score >= 40:
+        return "🟠 Timing fragile / patience"
+    return "🔴 Conditions peu favorables"
+
+
+def build_timing_conditions(current: Any, mm50: Any, mm200: Any, rsi: Any,
+                            macd: Any, signal: Any, days: Any) -> list[dict[str, Any]]:
+    """Construit les six confirmations binaires, en distinguant N/D et échec."""
+    conditions: list[dict[str, Any]] = []
+    def add(label: str, available: bool, passed: bool = False, current_value: Any = None,
+            target: Any = None, detail: str = "") -> None:
+        conditions.append({"label": label, "available": available,
+                           "passed": bool(passed) if available else False,
+                           "current": current_value if available else None,
+                           "target": target if available else None, "detail": detail})
+    for average, label in ((mm200, "Cours > MM200"), (mm50, "Cours > MM50")):
+        available = valid_number(current) and valid_number(average) and float(current) > 0
+        passed = available and float(current) > float(average)
+        detail = ""
+        if available:
+            if passed:
+                detail = f"{(float(current) / float(average) - 1) * 100:+.2f} % au-dessus"
+            else:
+                detail = f"{(float(average) / float(current) - 1) * 100:+.2f} % nécessaire"
+        add(label, available, passed, current, average, detail)
+    available = valid_number(mm50) and valid_number(mm200)
+    add("MM50 > MM200", available, available and float(mm50) > float(mm200), mm50, mm200)
+    available = valid_number(rsi)
+    add("RSI dans la zone de confirmation (45–70)", available,
+        available and 45 <= float(rsi) <= 70, rsi, "45–70",
+        f"RSI actuel : {float(rsi):.1f}" if available else "")
+    available = valid_number(macd) and valid_number(signal)
+    add("MACD > signal", available, available and float(macd) > float(signal), macd, signal,
+        f"MACD {float(macd):.2f} vs signal {float(signal):.2f}" if available else "")
+    available = isinstance(days, int) and days >= 0
+    add("Pas de résultats dans les 7 prochains jours", available,
+        available and days > 7, days, "> 7 jours",
+        f"Résultats dans {days} jour{'s' if days != 1 else ''}" if available else "")
+    return conditions
+
+
+def calculate_entry_timing(data: pd.DataFrame, info: dict[str, Any],
+                           events: dict[str, Any], mode: str) -> dict[str, Any]:
+    """Calcule l'indice déterministe de convergence des signaux d'entrée."""
+    del mode  # V1 robuste : barème identique pour les deux profils.
+    criteria: list[dict[str, Any]] = []
+    def criterion(category: str, key: str, label: str, maximum: float,
+                  value: Any, earned: float | None, passed: bool | None = None) -> None:
+        available = earned is not None and valid_number(value)
+        criteria.append({"category": category, "key": key, "label": label,
+                         "earned": float(earned) if available else None, "max": maximum,
+                         "available": available, "passed": passed if available else None,
+                         "current_value": float(value) if available else None})
+    row = data.iloc[-1] if not data.empty else pd.Series(dtype=float)
+    current, mm50, mm200 = row.get("Close"), row.get("MM50"), row.get("MM200")
+    rsi, macd, signal = row.get("RSI"), row.get("MACD"), row.get("Signal")
+    criterion("Tendance", "price_above_mm200", "Cours au-dessus de la MM200", 10, mm200,
+              10 if valid_number(current) and valid_number(mm200) and current > mm200 else (0 if valid_number(current) and valid_number(mm200) else None), valid_number(current) and valid_number(mm200) and current > mm200)
+    criterion("Tendance", "price_above_mm50", "Cours au-dessus de la MM50", 8, mm50,
+              8 if valid_number(current) and valid_number(mm50) and current > mm50 else (0 if valid_number(current) and valid_number(mm50) else None), valid_number(current) and valid_number(mm50) and current > mm50)
+    criterion("Tendance", "mm50_above_mm200", "MM50 au-dessus de la MM200", 8, mm50 if valid_number(mm200) else None,
+              8 if valid_number(mm50) and valid_number(mm200) and mm50 > mm200 else (0 if valid_number(mm50) and valid_number(mm200) else None), valid_number(mm50) and valid_number(mm200) and mm50 > mm200)
+    old_mm50 = data["MM50"].iloc[-11] if "MM50" in data and len(data) >= 11 else None
+    criterion("Tendance", "mm50_slope", "MM50 orientée à la hausse", 4, old_mm50,
+              4 if valid_number(mm50) and valid_number(old_mm50) and mm50 > old_mm50 else (0 if valid_number(mm50) and valid_number(old_mm50) else None), valid_number(mm50) and valid_number(old_mm50) and mm50 > old_mm50)
+    rsi_points = None
+    if valid_number(rsi):
+        rv = float(rsi)
+        rsi_points = 10 if 45 <= rv <= 60 else 7 if 60 < rv <= 70 else 6 if 40 <= rv < 45 else 3 if 30 < rv < 40 else 2 if rv > 70 else 4
+    criterion("Momentum", "rsi", "RSI 14", 10, rsi, rsi_points, valid_number(rsi) and 45 <= float(rsi) <= 70)
+    criterion("Momentum", "macd_cross", "MACD supérieur au signal", 10, macd if valid_number(signal) else None,
+              10 if valid_number(macd) and valid_number(signal) and macd > signal else (0 if valid_number(macd) and valid_number(signal) else None), valid_number(macd) and valid_number(signal) and macd > signal)
+    old_gap = data["MACD"].iloc[-6] - data["Signal"].iloc[-6] if len(data) >= 6 and {"MACD", "Signal"}.issubset(data.columns) else None
+    gap = macd - signal if valid_number(macd) and valid_number(signal) else None
+    criterion("Momentum", "macd_improving", "Momentum MACD en amélioration", 5, old_gap,
+              5 if valid_number(gap) and valid_number(old_gap) and gap > old_gap else (0 if valid_number(gap) and valid_number(old_gap) else None), valid_number(gap) and valid_number(old_gap) and gap > old_gap)
+    distance = float(current) / float(mm50) - 1 if valid_number(current) and valid_number(mm50) and float(mm50) else None
+    distance_points = None
+    if distance is not None:
+        distance_points = 10 if -.02 <= distance <= .05 else 7 if .05 < distance <= .10 else 5 if -.05 <= distance < -.02 else 4 if .10 < distance <= .15 else 2
+    criterion("Zone de prix", "distance_mm50", "Distance à la MM50", 10, distance, distance_points, distance is not None and -.02 <= distance <= .05)
+    high, low = data["High"].tail(252).max() if "High" in data else None, data["Low"].tail(252).min() if "Low" in data else None
+    position = (float(current)-float(low))/(float(high)-float(low)) if all(valid_number(x) for x in (current, high, low)) and high > low else None
+    position_points = None
+    if position is not None:
+        position_points = 5 if .35 <= position <= .80 else 4 if .20 <= position < .35 else 3 if .80 < position <= .92 else 2 if position < .20 else 1
+    criterion("Zone de prix", "position_52w", "Position dans la fourchette 52 semaines", 5, position, position_points)
+    atr_series = calculate_atr(data)
+    atr = atr_series.iloc[-1] if not atr_series.empty else None
+    extension = abs(float(current)-float(mm50))/float(atr) if all(valid_number(x) for x in (current, mm50, atr)) and atr > 0 else None
+    extension_points = 5 if extension is not None and extension <= 1 else 4 if extension is not None and extension <= 2 else 2 if extension is not None and extension <= 3 else 0 if extension is not None else None
+    criterion("Zone de prix", "extension_atr", "Extension par rapport à la MM50", 5, extension, extension_points, extension is not None and extension <= 2)
+    volatility = data["Close"].pct_change().dropna().std() * sqrt(252) if "Close" in data else None
+    vol_points = None
+    if valid_number(volatility):
+        vol_points = 10 if volatility < .20 else 8 if volatility <= .30 else 6 if volatility <= .40 else 3 if volatility <= .55 else 1
+    criterion("Risque", "volatility", "Volatilité annualisée", 10, volatility, vol_points, valid_number(volatility) and volatility <= .30)
+    atr_percent = float(atr)/float(current) if valid_number(atr) and valid_number(current) and current > 0 else None
+    atrp_points = 5 if atr_percent is not None and atr_percent < .02 else 4 if atr_percent is not None and atr_percent <= .03 else 3 if atr_percent is not None and atr_percent <= .045 else 1 if atr_percent is not None and atr_percent <= .06 else 0 if atr_percent is not None else None
+    criterion("Risque", "atr_percent", "ATR en pourcentage du cours", 5, atr_percent, atrp_points, atr_percent is not None and atr_percent <= .03)
+    days = events.get("days_until_earnings") if isinstance(events, dict) else None
+    event_points = 0 if isinstance(days, int) and 0 <= days <= 3 else 3 if isinstance(days, int) and 4 <= days <= 7 else 6 if isinstance(days, int) and 8 <= days <= 14 else 10 if isinstance(days, int) and days > 14 else None
+    criterion("Événements", "earnings", "Éloignement des prochains résultats", 10, days, event_points, isinstance(days, int) and days > 7)
+    available = [item for item in criteria if item["available"]]
+    available_max = sum(item["max"] for item in available)
+    earned = sum(item["earned"] for item in available)
+    score = earned / available_max * 100 if available_max else None
+    categories = {}
+    for name in ("Tendance", "Momentum", "Zone de prix", "Risque", "Événements"):
+        items = [item for item in available if item["category"] == name]
+        maximum = sum(item["max"] for item in items)
+        categories[name] = sum(item["earned"] for item in items) / maximum * 100 if maximum else None
+    positives, warnings = [], []
+    lookup = {item["key"]: item for item in criteria}
+    if lookup["price_above_mm200"]["passed"]: positives.append(f"Cours au-dessus de la MM200 ({(current/mm200-1)*100:+.1f} %)")
+    elif lookup["price_above_mm200"]["available"]: warnings.append(f"Cours sous la MM200 de {(1-current/mm200)*100:.1f} %")
+    if lookup["price_above_mm50"]["passed"]: positives.append(f"Cours au-dessus de la MM50 ({(current/mm50-1)*100:+.1f} %)")
+    elif lookup["price_above_mm50"]["available"]: warnings.append(f"Cours sous la MM50 de {(1-current/mm50)*100:.1f} %")
+    if lookup["mm50_above_mm200"]["passed"]: positives.append("MM50 au-dessus de la MM200")
+    elif lookup["mm50_above_mm200"]["available"]: warnings.append("MM50 sous la MM200")
+    if lookup["mm50_slope"]["passed"]: positives.append("MM50 orientée à la hausse")
+    if valid_number(rsi) and 45 <= rsi <= 60: positives.append(f"RSI {rsi:.1f} : momentum équilibré")
+    elif valid_number(rsi) and rsi > 70: warnings.append(f"RSI élevé à {rsi:.1f} : titre potentiellement étendu")
+    elif valid_number(rsi) and rsi < 45: warnings.append(f"RSI faible à {rsi:.1f}")
+    if lookup["macd_cross"]["passed"]: positives.append("MACD supérieur au signal")
+    elif lookup["macd_cross"]["available"]: warnings.append("MACD inférieur au signal")
+    if lookup["macd_improving"]["passed"]: positives.append("Momentum MACD en amélioration")
+    if (distance is not None and distance > .12) or (extension is not None and extension > 3): warnings.append("Le cours est fortement étendu par rapport à sa tendance récente")
+    if valid_number(volatility) and volatility <= .30: positives.append(f"Volatilité contenue à {volatility:.0%}")
+    elif valid_number(volatility) and volatility > .40: warnings.append(f"Volatilité élevée : {volatility:.0%}")
+    if isinstance(days, int) and days > 14: positives.append("Aucun résultat prévu dans les 14 prochains jours")
+    elif isinstance(days, int) and days <= 7: warnings.append(f"Résultats dans {days} jour{'s' if days != 1 else ''}")
+    zones = calculate_price_zones(data, float(atr) if valid_number(atr) else None)
+    conditions = build_timing_conditions(current, mm50, mm200, rsi, macd, signal, days)
+    confirmed = sum(item["passed"] for item in conditions if item["available"])
+    condition_max = sum(item["available"] for item in conditions)
+    confirmation_level = float(mm50) if valid_number(current) and valid_number(mm50) and current < mm50 else zones["resistance"] if valid_number(zones["resistance"]) and zones["resistance"] > current else None
+    return {"score": score, "confidence": round(available_max), "verdict": timing_verdict(score),
+            "categories": categories, "criteria": criteria, "positive_signals": positives[:6],
+            "warning_signals": warnings[:6], "conditions": conditions,
+            "confirmed_conditions": confirmed, "available_conditions": condition_max,
+            "support_zone": zones["support_zone"], "resistance_zone": zones["resistance_zone"],
+            "support": zones["support"], "resistance": zones["resistance"],
+            "confirmation_level": confirmation_level, "atr": float(atr) if valid_number(atr) else None,
+            "atr_percent": atr_percent, "current": float(current) if valid_number(current) else None,
+            "mm50": float(mm50) if valid_number(mm50) else None, "mm200": float(mm200) if valid_number(mm200) else None,
+            "distance_mm50": distance, "extension_atr": extension,
+            "available_points": earned, "maximum_available_points": available_max}
+
+
+def build_entry_decision(global_score: float, timing_result: dict[str, Any],
+                         valuation_score: float | None) -> dict[str, str]:
+    timing = timing_result.get("score")
+    if not valid_number(timing):
+        main = "⚪ Lecture combinée non déterminable faute de données Timing"
+    elif global_score >= 70 and timing >= 70:
+        main = "🟢 Action intéressante — conditions actuelles favorables"
+    elif global_score >= 70 and timing >= 55:
+        main = "🟠 Action intéressante — attendre une confirmation"
+    elif global_score >= 70:
+        main = "🟠 Bonne qualité — timing actuellement fragile"
+    elif global_score < 55 and timing >= 70:
+        main = "🟡 Momentum intéressant, mais qualité globale insuffisante"
+    elif global_score < 55 and timing < 55:
+        main = "🔴 Profil global et timing peu favorables"
+    else:
+        main = "🟠 Profil global intermédiaire — confirmations à surveiller"
+    secondary = "🔵 Entreprise solide — valorisation exigeante" if global_score >= 70 and valid_number(valuation_score) and valuation_score < 40 and valid_number(timing) and timing >= 55 else ""
+    return {"verdict": main, "detail": secondary}
+
+
+def render_entry_timing(timing: dict[str, Any], global_score: float,
+                        global_verdict: str, valuation_score: float | None,
+                        currency: str, info: dict[str, Any]) -> None:
+    """Affiche séparément qualité, Timing, confirmations et zones techniques."""
+    st.subheader("🧭 Analyse du timing d'entrée")
+    score = timing.get("score")
+    score_text = f"{score:.0f}/100" if valid_number(score) else "N/D"
+    decision = build_entry_decision(global_score, timing, valuation_score)
+    decision_detail = f'<p class="info">{escape(decision["detail"])}</p>' if decision["detail"] else ""
+    st.markdown(
+        f'<div class="decision"><div class="trade-row"><span><b>QUALITÉ / SCORE GLOBAL</b><br>'
+        f'<span class="score">{global_score:.0f}<small>/100</small></span><br>{escape(global_verdict)}</span>'
+        f'<span><b>TIMING ACTUEL</b><br><span class="score">{escape(score_text)}</span><br>'
+        f'{escape(timing["verdict"])}<br><span class="muted">Confiance Timing : {timing["confidence"]} %</span></span></div>'
+        f'<p class="verdict">{escape(decision["verdict"])}</p>'
+        f'{decision_detail}'
+        '<p class="disclaimer">Le score Timing mesure la convergence actuelle de plusieurs signaux. '
+        'Il ne représente pas une probabilité de hausse.</p></div>', unsafe_allow_html=True,
+    )
+    bars = ""
+    for label, value in timing["categories"].items():
+        shown = f"{value:.0f}/100" if valid_number(value) else "N/D"
+        width = float(value) if valid_number(value) else 0
+        bars += (f'<div class="bar-row"><span>{escape(label)}</span><div class="bar-track">'
+                 f'<div class="bar-fill" style="width:{width:.0f}%;background:#60a5fa"></div></div><b>{shown}</b></div>')
+    st.markdown(f'<div class="card"><h3>Sous-scores Timing</h3>{bars}</div>', unsafe_allow_html=True)
+    good, warn = st.columns(2)
+    with good:
+        items = "".join(f"<li>{escape(text)}</li>" for text in timing["positive_signals"]) or "<li>Aucun signal disponible</li>"
+        st.markdown(f'<div class="card"><h3 class="good">✅ Encourageant aujourd’hui</h3><ul>{items}</ul></div>', unsafe_allow_html=True)
+    with warn:
+        warnings = list(timing["warning_signals"])
+        if valid_number(valuation_score) and valuation_score < 40:
+            warnings.append("Valorisation exigeante selon le score Valorisation")
+            if valid_number(info.get("trailingPE")):
+                warnings.append(f"P/E actuel : {float(info['trailingPE']):.1f}x")
+            if valid_number(info.get("priceToBook")):
+                warnings.append(f"Price / Book actuel : {float(info['priceToBook']):.1f}x")
+        items = "".join(f"<li>{escape(text)}</li>" for text in warnings[:6]) or "<li>Aucun avertissement disponible</li>"
+        st.markdown(f'<div class="card"><h3 class="warn">⚠️ À surveiller / raisons d’attendre</h3><ul>{items}</ul></div>', unsafe_allow_html=True)
+    if global_score >= 70 and valid_number(timing.get("distance_mm50")) and -.05 <= timing["distance_mm50"] < 0:
+        rsi_item = next((x for x in timing["criteria"] if x["key"] == "rsi"), None)
+        above_200 = next((x for x in timing["criteria"] if x["key"] == "price_above_mm200"), None)
+        if rsi_item and rsi_item["available"] and 35 <= rsi_item["current_value"] <= 50 and above_200 and above_200["passed"]:
+            st.info("🟡 Repli technique à surveiller sur une action dont le score global reste favorable. Une confirmation RSI, MACD ou MM50 reste nécessaire.")
+    st.markdown("### 🎯 Conditions à surveiller")
+    for condition in timing["conditions"]:
+        if not condition["available"]:
+            st.markdown(f"⚪ **{condition['label']} — N/D**")
+            continue
+        icon = "✅" if condition["passed"] else "❌"
+        details = condition["detail"] or "Condition validée" if condition["passed"] else condition["detail"]
+        st.markdown(f"{icon} **{condition['label']}**  \n{escape(str(details))}")
+    available = timing["available_conditions"]
+    confirmed = timing["confirmed_conditions"]
+    percent = round(confirmed / available * 100) if available else 0
+    st.progress(percent / 100, text=f"Confirmation actuelle : {confirmed} / {available} conditions validées — {percent} %" if available else "Confirmation actuelle : N/D")
+    st.caption("Ce taux binaire de confirmation est distinct du score Timing pondéré.")
+    st.markdown("### 📍 Zones techniques à surveiller")
+    def zone_text(zone: Any) -> str:
+        return f"{format_price(zone[0], currency)} – {format_price(zone[1], currency)}" if isinstance(zone, tuple) else "N/D"
+    rows = [("Cours actuel", format_price(timing.get("current"), currency)),
+            ("Support récent", zone_text(timing.get("support_zone"))),
+            ("MM50", format_price(timing.get("mm50"), currency)),
+            ("MM200", format_price(timing.get("mm200"), currency)),
+            ("Résistance récente", zone_text(timing.get("resistance_zone"))),
+            ("ATR 14", format_price(timing.get("atr"), currency)),
+            ("ATR / cours", f"{timing['atr_percent']:.2%}" if valid_number(timing.get("atr_percent")) else "N/D"),
+            ("Premier niveau de confirmation technique à surveiller", format_price(timing.get("confirmation_level"), currency))]
+    html = "".join(f'<div class="trade-row"><span>{escape(label)}</span><span class="value">{escape(value)}</span></div>' for label, value in rows)
+    current, mm50, mm200 = timing.get("current"), timing.get("mm50"), timing.get("mm200")
+    reading = ""
+    if all(valid_number(x) for x in (current, mm50, mm200)) and current < mm50 and current < mm200:
+        reading = "Le cours reste sous ses deux moyennes mobiles principales."
+    elif all(valid_number(x) for x in (current, mm50, mm200)) and current > mm50 and current > mm200:
+        reading = "Le cours évolue au-dessus de ses moyennes mobiles principales."
+    elif valid_number(timing.get("support")) and valid_number(mm50) and timing["support"] < current < mm50:
+        reading = "Le cours évolue actuellement entre son support récent et sa MM50."
+    reading_html = f'<p class="muted">{escape(reading)}</p>' if reading else ""
+    st.markdown(f'<div class="card">{html}{reading_html}</div>', unsafe_allow_html=True)
 
 
 def score_analysis(data: pd.DataFrame, info: dict[str, Any], mode: str) -> tuple[dict[str, float], list[str], list[str]]:
@@ -1280,6 +1605,15 @@ def render_dashboard(ticker: str, period: str, mode: str) -> None:
     available_count = sum(valid_number(metric) for metric in confidence_metrics)
     confidence_percent = round(available_count / len(confidence_metrics) * 100)
     verdict = score_verdict(global_score)
+    # Une seule collecte événementielle par analyse ; le même objet alimente
+    # l'interface, le moteur Timing et l'instantané Gemini.
+    events = get_key_events(ticker, info)
+    timing_history = history
+    if len(history) < 220:
+        with st.spinner("Chargement de l'historique nécessaire au Timing…"):
+            timing_history, _ = load_stock_data(ticker, "1y")
+    timing_data = calculate_indicators(timing_history)
+    timing = calculate_entry_timing(timing_data, info, events, mode)
 
     st.title(name)
     st.markdown(
@@ -1328,6 +1662,7 @@ def render_dashboard(ticker: str, period: str, mode: str) -> None:
 
     st.subheader("Graphique & moyennes mobiles")
     render_chart(data, ticker)
+    render_entry_timing(timing, global_score, verdict, scores.get("Valorisation"), currency, info)
 
     stop_loss, take_profit = calculate_trade_levels(current, mode)
     risk_reward = (take_profit - current) / (current - stop_loss)
@@ -1368,12 +1703,11 @@ def render_dashboard(ticker: str, period: str, mode: str) -> None:
         items = "".join(f'<li>{escape(item)}</li>' for item in unfavorable) or "<li>Aucun signal défavorable majeur détecté</li>"
         st.markdown(f'<div class="card"><h3 class="bad">Arguments défavorables</h3><ul>{items}</ul></div>', unsafe_allow_html=True)
 
-    events = get_key_events(ticker, info)
     render_key_events(events, currency)
     ai_snapshot = build_ai_snapshot(
         ticker, company_name, mode, global_score, verdict, scores, info, current,
         rsi, macd, signal, volatility, distance_mm50, distance_mm200, position_52w,
-        events,
+        events, timing,
     )
     render_ai_opinion(ai_snapshot, ticker, mode, period)
 
@@ -1384,7 +1718,7 @@ def render_dashboard(ticker: str, period: str, mode: str) -> None:
     )
     trade_rows = f"""
   <p>{escape(summary)}</p>
-  <h3>Plan mécanique</h3>
+  <h3>Plan mécanique indicatif</h3>
   <div class="trade-row"><span>Stop-Loss indicatif</span><span class="value bad">{format_price(stop_loss, currency)} ({format_percentage(stop_loss/current-1, decimal=True)})</span></div>
   <div class="trade-row"><span>Take-Profit indicatif</span><span class="value good">{format_price(take_profit, currency)} ({format_percentage(take_profit/current-1, decimal=True)})</span></div>
   <div class="trade-row"><span>Ratio risque / récompense</span><span class="value">1 : {risk_reward:.1f}</span></div>
