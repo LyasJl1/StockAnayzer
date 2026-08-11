@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from datetime import date, datetime, timezone
 from html import escape
 from math import isfinite, sqrt
 from typing import Any
@@ -96,6 +97,181 @@ def format_large_amount(value: Any, symbol: str) -> str:
         if absolute >= divisor:
             return f"{symbol}{amount / divisor:,.2f} {suffix}"
     return format_price(amount, symbol)
+
+
+def _normalise_event_dates(value: Any) -> list[date]:
+    """Extrait récursivement des dates, malgré les formats variables de Yahoo."""
+    dates: list[date] = []
+    if isinstance(value, (datetime, pd.Timestamp)):
+        timestamp = pd.Timestamp(value)
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.tz_convert("UTC").tz_localize(None)
+        dates.append(timestamp.date())
+    elif isinstance(value, date):
+        dates.append(value)
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            dates.extend(_normalise_event_dates(item))
+    elif isinstance(value, dict):
+        for item in value.values():
+            dates.extend(_normalise_event_dates(item))
+    elif isinstance(value, pd.Series):
+        dates.extend(_normalise_event_dates(value.tolist()))
+    elif isinstance(value, pd.DataFrame):
+        dates.extend(_normalise_event_dates(value.to_dict()))
+    elif isinstance(value, str):
+        try:
+            parsed = pd.to_datetime(value, errors="raise")
+        except (TypeError, ValueError, OverflowError):
+            pass
+        else:
+            dates.extend(_normalise_event_dates(parsed))
+    return sorted(set(dates))
+
+
+def _calendar_earnings_dates(calendar: Any) -> list[date]:
+    """Repère uniquement le champ de résultats d'un calendrier Yahoo."""
+    aliases = {"earningsdate", "earningsdates", "earnings date", "earnings dates"}
+    matches: list[date] = []
+    if isinstance(calendar, dict):
+        for key, value in calendar.items():
+            if str(key).strip().lower() in aliases:
+                matches.extend(_normalise_event_dates(value))
+            elif isinstance(value, (dict, pd.DataFrame)):
+                matches.extend(_calendar_earnings_dates(value))
+    elif isinstance(calendar, pd.DataFrame):
+        for label in calendar.columns:
+            if str(label).strip().lower() in aliases:
+                matches.extend(_normalise_event_dates(calendar[label]))
+        for label in calendar.index:
+            if str(label).strip().lower() in aliases:
+                matches.extend(_normalise_event_dates(calendar.loc[label]))
+    return sorted(set(matches))
+
+
+def _info_date(value: Any) -> date | None:
+    """Convertit une date Yahoo (notamment un timestamp Unix) sans l'inventer."""
+    if valid_number(value):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc).date()
+        except (ValueError, OverflowError, OSError):
+            return None
+    dates = _normalise_event_dates(value)
+    return dates[0] if dates else None
+
+
+def get_key_events(ticker: str, info: dict[str, Any]) -> dict[str, Any]:
+    """Charge les résultats et dividendes Yahoo sans bloquer l'analyse principale."""
+    try:
+        stock = yf.Ticker(ticker)
+    except Exception:
+        stock = None
+    calendar: Any = None
+    if stock is not None:
+        try:
+            calendar = stock.get_calendar()
+        except Exception:
+            calendar = None
+    calendar_empty = calendar is None or (hasattr(calendar, "empty") and bool(calendar.empty))
+    calendar_empty = calendar_empty or (isinstance(calendar, dict) and not calendar)
+    if calendar_empty and stock is not None:
+        try:
+            calendar = stock.calendar
+        except Exception:
+            calendar = None
+
+    today = datetime.now(timezone.utc).date()
+    future_earnings = [item for item in _calendar_earnings_dates(calendar) if item >= today]
+    # Une fenêtre Yahoo contient généralement deux bornes proches ; on la conserve.
+    earnings_dates = future_earnings[:2]
+
+    last_dividend_amount: float | None = None
+    last_dividend_date: date | None = None
+    if stock is not None:
+        try:
+            dividends = stock.get_dividends(period="1y")
+            if isinstance(dividends, pd.Series) and not dividends.dropna().empty:
+                last_index = dividends.dropna().index[-1]
+                last_value = dividends.dropna().iloc[-1]
+                if valid_number(last_value):
+                    last_dividend_amount = float(last_value)
+                    normalised = _normalise_event_dates(last_index)
+                    last_dividend_date = normalised[0] if normalised else None
+        except Exception:
+            pass
+
+    annual_dividend = info.get("dividendRate") if isinstance(info, dict) else None
+    dividend_yield = info.get("dividendYield") if isinstance(info, dict) else None
+    if not valid_number(dividend_yield) and valid_number(annual_dividend):
+        current_price = info.get("currentPrice")
+        if not valid_number(current_price):
+            current_price = info.get("regularMarketPrice")
+        if valid_number(current_price) and float(current_price) > 0:
+            dividend_yield = float(annual_dividend) / float(current_price)
+    return {
+        "earnings_dates": earnings_dates,
+        "days_until_earnings": (earnings_dates[0] - today).days if earnings_dates else None,
+        "annual_dividend": float(annual_dividend) if valid_number(annual_dividend) else None,
+        "dividend_yield": float(dividend_yield) if valid_number(dividend_yield) else None,
+        "ex_dividend_date": _info_date(info.get("exDividendDate")) if isinstance(info, dict) else None,
+        "last_dividend_amount": last_dividend_amount,
+        "last_dividend_date": last_dividend_date,
+    }
+
+
+def _format_french_date(value: date | None) -> str:
+    if value is None:
+        return "N/D"
+    months = ("janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre")
+    return f"{value.day} {months[value.month - 1]} {value.year}"
+
+
+def render_key_events(events: dict[str, Any], currency_symbol: str) -> None:
+    """Affiche les événements à titre informatif, sans incidence sur le score."""
+    st.subheader("📅 Prochains événements clés")
+    earnings_dates = events.get("earnings_dates") if isinstance(events, dict) else None
+    earnings_dates = earnings_dates if isinstance(earnings_dates, list) else []
+    if len(earnings_dates) > 1:
+        earnings_text = f"{_format_french_date(earnings_dates[0])} – {_format_french_date(earnings_dates[1])}"
+    elif earnings_dates:
+        earnings_text = _format_french_date(earnings_dates[0])
+    else:
+        earnings_text = "N/D"
+    days = events.get("days_until_earnings") if isinstance(events, dict) else None
+    countdown = ""
+    if isinstance(days, int):
+        countdown = "Aujourd’hui" if days == 0 else f"Dans {days} jours"
+
+    annual = format_price(events.get("annual_dividend"), currency_symbol)
+    yield_value = events.get("dividend_yield")
+    dividend_yield = f"{float(yield_value) * 100:.2f} %" if valid_number(yield_value) else "N/D"
+    ex_date = _format_french_date(events.get("ex_dividend_date"))
+    last_amount = format_price(events.get("last_dividend_amount"), currency_symbol)
+    last_date = _format_french_date(events.get("last_dividend_date"))
+    left, right = st.columns(2)
+    with left:
+        st.markdown(
+            f'<div class="card"><h3>📊 Résultats</h3><div class="value">{escape(earnings_text)}</div>'
+            f'<p class="muted">{escape(countdown)}</p></div>', unsafe_allow_html=True,
+        )
+    with right:
+        st.markdown(
+            f'<div class="card"><h3>💰 Dividende</h3>'
+            f'<div class="trade-row"><span>Dividende annuel indiqué</span><span class="value">{escape(annual)}</span></div>'
+            f'<div class="trade-row"><span>Rendement actuel</span><span class="value">{escape(dividend_yield)}</span></div>'
+            f'<div class="trade-row"><span>Date ex-dividende</span><span class="value">{escape(ex_date)}</span></div>'
+            f'<div class="trade-row"><span>Dernier dividende versé</span><span class="value">{escape(last_amount)}</span></div>'
+            f'<div class="trade-row"><span>Date du dernier versement</span><span class="value">{escape(last_date)}</span></div></div>',
+            unsafe_allow_html=True,
+        )
+    if isinstance(days, int) and 0 <= days <= 7:
+        alert = "⚠️ Publication de résultats prévue aujourd'hui" if days == 0 else f"⚠️ Résultats imminents dans {days} jours"
+        st.markdown(
+            f'<div class="decision"><b class="bad">{escape(alert)}</b><br>'
+            '<span class="muted">Une publication de résultats peut entraîner une hausse temporaire de la volatilité.</span></div>',
+            unsafe_allow_html=True,
+        )
+    st.markdown('<p class="disclaimer">Données événementielles fournies par Yahoo Finance et susceptibles d’être modifiées.</p>', unsafe_allow_html=True)
 
 
 def tier_score(value: Any, tiers: tuple[tuple[float, float], ...], default: float) -> float | None:
@@ -550,6 +726,8 @@ def render_dashboard(ticker: str, period: str, mode: str) -> None:
     with con:
         items = "".join(f'<li>{escape(item)}</li>' for item in unfavorable) or "<li>Aucun signal défavorable majeur détecté</li>"
         st.markdown(f'<div class="card"><h3 class="bad">Arguments défavorables</h3><ul>{items}</ul></div>', unsafe_allow_html=True)
+
+    render_key_events(get_key_events(ticker, info), currency)
 
     st.subheader("Synthèse d'aide à la décision")
     summary = build_summary(
