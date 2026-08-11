@@ -201,18 +201,26 @@ def get_key_events(ticker: str, info: dict[str, Any]) -> dict[str, Any]:
             pass
 
     annual_dividend = info.get("dividendRate") if isinstance(info, dict) else None
-    dividend_yield = info.get("dividendYield") if isinstance(info, dict) else None
-    if not valid_number(dividend_yield) and valid_number(annual_dividend):
-        current_price = info.get("currentPrice")
-        if not valid_number(current_price):
-            current_price = info.get("regularMarketPrice")
-        if valid_number(current_price) and float(current_price) > 0:
-            dividend_yield = float(annual_dividend) / float(current_price)
+    current_price = info.get("currentPrice") if isinstance(info, dict) else None
+    if not valid_number(current_price) and isinstance(info, dict):
+        current_price = info.get("regularMarketPrice")
+
+    # On normalise le rendement en ratio décimal (ex. 0.0045 = 0,45 %).
+    # La priorité va au calcul montant annuel / cours, afin d'éviter les unités
+    # parfois ambiguës du champ Yahoo `dividendYield`.
+    dividend_yield: float | None = None
+    if valid_number(annual_dividend) and valid_number(current_price) and float(current_price) > 0:
+        dividend_yield = float(annual_dividend) / float(current_price)
+    elif isinstance(info, dict):
+        trailing_yield = info.get("trailingAnnualDividendYield")
+        if valid_number(trailing_yield) and float(trailing_yield) >= 0:
+            dividend_yield = float(trailing_yield)
+
     return {
         "earnings_dates": earnings_dates,
         "days_until_earnings": (earnings_dates[0] - today).days if earnings_dates else None,
         "annual_dividend": float(annual_dividend) if valid_number(annual_dividend) else None,
-        "dividend_yield": float(dividend_yield) if valid_number(dividend_yield) else None,
+        "dividend_yield": dividend_yield,
         "ex_dividend_date": _info_date(info.get("exDividendDate")) if isinstance(info, dict) else None,
         "last_dividend_amount": last_dividend_amount,
         "last_dividend_date": last_dividend_date,
