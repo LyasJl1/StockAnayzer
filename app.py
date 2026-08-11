@@ -335,6 +335,8 @@ def comparison_winner(metric: str, left: Any, right: Any, tickers: tuple[str, st
         if abs(a - b) < 1e-12:
             return "⚖️ Égalité"
         return f"🏆 {tickers[0] if a < b else tickers[1]}"
+    if metric == "price":
+        return "—"
     if not valid_number(left) and not valid_number(right):
         return "—"
     if not valid_number(left):
@@ -343,6 +345,15 @@ def comparison_winner(metric: str, left: Any, right: Any, tickers: tuple[str, st
         return f"🏆 {tickers[0]}"
     a, b = float(left), float(right)
     if metric == "volatility":
+    if metric in {"pe", "price_to_book"}:
+        if a <= 0 and b <= 0:
+            return "—"
+        if a <= 0:
+            return f"🏆 {tickers[1]}"
+        if b <= 0:
+            return f"🏆 {tickers[0]}"
+        better = a < b
+    elif metric == "volatility":
         better = a < b
     elif metric == "rsi":
         a_target, b_target = 40 <= a <= 65, 40 <= b <= 65
