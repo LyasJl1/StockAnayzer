@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from html import escape
+from math import isfinite
 from datetime import datetime, timezone
 from html import escape
 from typing import Any
@@ -55,6 +57,8 @@ def apply_styles() -> None:
 def valid_number(value: Any) -> bool:
     """Indique si une valeur peut être affichée comme nombre fini."""
     try:
+        return value is not None and bool(pd.notna(value)) and isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
         return value is not None and pd.notna(value) and float(value) not in (float("inf"), float("-inf"))
     except (TypeError, ValueError):
         return False
@@ -105,6 +109,7 @@ def load_stock_data(ticker_symbol: str) -> tuple[pd.DataFrame, dict[str, Any]]:
 
     history = history.copy()
     history["Close"] = pd.to_numeric(history["Close"], errors="coerce")
+    history.loc[~history["Close"].map(isfinite), "Close"] = pd.NA
     history = history.dropna(subset=["Close"]).sort_index()
     if history.empty:
         raise ValueError("Les cours de clôture sont indisponibles.")
@@ -177,6 +182,12 @@ def render_dashboard(ticker_symbol: str, period: str) -> None:
     history = history.copy()
     history["MM200"] = history["Close"].rolling(window=200, min_periods=200).mean()
     current_price = float(history["Close"].iloc[-1])
+    previous_close = float(history["Close"].iloc[-2]) if len(history) >= 2 else None
+    daily_change = (
+        current_price / previous_close - 1
+        if valid_number(previous_close) and previous_close != 0
+        else None
+    )
     daily_change = (current_price / float(history["Close"].iloc[-2]) - 1) if len(history) >= 2 else None
     latest_ma = history["MM200"].dropna()
     ma200 = float(latest_ma.iloc[-1]) if not latest_ma.empty else None
@@ -229,6 +240,11 @@ def render_dashboard(ticker_symbol: str, period: str) -> None:
         st.write(f"**Entrée théorique :** {format_price(current_price, currency)}")
         st.markdown(f'<p class="stop"><b>Stop-Loss (-7 %) :</b> {format_price(stop_loss, currency)}</p>', unsafe_allow_html=True)
         st.markdown(f'<p class="target"><b>Take-Profit (+15 %) :</b> {format_price(take_profit, currency)}</p>', unsafe_allow_html=True)
+        ratio_label = f"1 : {risk_reward:.2f}" if valid_number(risk_reward) else "N/A"
+        st.markdown(
+            f'<div class="badge {ratio_class}">Risque / récompense&nbsp;: {ratio_label}</div>',
+            unsafe_allow_html=True,
+        )
         st.markdown(f'<div class="badge {ratio_class}">Risque / récompense&nbsp;: 1 : {risk_reward:.2f}</div>', unsafe_allow_html=True)
         st.caption("Niveaux mécaniques et indicatifs, sans prise en compte de la volatilité, des frais ni de votre profil de risque.")
         st.markdown("</div>", unsafe_allow_html=True)
@@ -250,6 +266,12 @@ def main() -> None:
         if not ticker_symbol:
             st.error("Veuillez saisir un ticker valide.")
         else:
+            # Le clic demande explicitement une actualisation, même pendant le TTL du cache.
+            load_stock_data.clear()
+            st.session_state["analysis"] = {
+                "ticker": ticker_symbol,
+                "period": PERIODS[period_label],
+            }
             st.session_state["analysis"] = {"ticker": ticker_symbol, "period": PERIODS[period_label],
                                              "requested_at": datetime.now(timezone.utc).isoformat()}
 
