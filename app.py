@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from html import escape
 from math import isfinite
+from datetime import datetime, timezone
+from html import escape
 from typing import Any
 
 import pandas as pd
@@ -57,6 +59,8 @@ def valid_number(value: Any) -> bool:
     try:
         return value is not None and bool(pd.notna(value)) and isfinite(float(value))
     except (TypeError, ValueError, OverflowError):
+        return value is not None and pd.notna(value) and float(value) not in (float("inf"), float("-inf"))
+    except (TypeError, ValueError):
         return False
 
 
@@ -184,6 +188,7 @@ def render_dashboard(ticker_symbol: str, period: str) -> None:
         if valid_number(previous_close) and previous_close != 0
         else None
     )
+    daily_change = (current_price / float(history["Close"].iloc[-2]) - 1) if len(history) >= 2 else None
     latest_ma = history["MM200"].dropna()
     ma200 = float(latest_ma.iloc[-1]) if not latest_ma.empty else None
     ma_gap = (current_price / ma200 - 1) if valid_number(ma200) and ma200 != 0 else None
@@ -240,6 +245,7 @@ def render_dashboard(ticker_symbol: str, period: str) -> None:
             f'<div class="badge {ratio_class}">Risque / récompense&nbsp;: {ratio_label}</div>',
             unsafe_allow_html=True,
         )
+        st.markdown(f'<div class="badge {ratio_class}">Risque / récompense&nbsp;: 1 : {risk_reward:.2f}</div>', unsafe_allow_html=True)
         st.caption("Niveaux mécaniques et indicatifs, sans prise en compte de la volatilité, des frais ni de votre profil de risque.")
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -266,6 +272,8 @@ def main() -> None:
                 "ticker": ticker_symbol,
                 "period": PERIODS[period_label],
             }
+            st.session_state["analysis"] = {"ticker": ticker_symbol, "period": PERIODS[period_label],
+                                             "requested_at": datetime.now(timezone.utc).isoformat()}
 
     analysis = st.session_state.get("analysis")
     if not analysis:
