@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+"""Assistant Streamlit d'analyse multifactorielle d'actions."""
 """Assistant Streamlit d'analyse multifactorielle d'actions."""
 """Tableau de bord Streamlit d'analyse fondamentale et technique d'actions."""
 
@@ -402,6 +404,22 @@ def render_dashboard(symbol: str, period: str, mode: str) -> None:
     cols[1].metric("P/E", format_ratio(f["pe"]), help=HELP["P/E"]); cols[2].metric("Marge nette", format_percentage(f["net_margin"]), help=HELP["Marge nette"]); cols[3].metric("Croissance du CA", format_percentage(f["revenue_growth"], True))
 
     st.subheader("Analyse & Aide à la décision")
+    decision_html = (
+        f"""<div class="decision">
+        <div class="muted">Score global pondéré • Mode {escape(mode)}</div>
+        <div class="score">{global_score:.0f} / 100</div>
+        <div class="verdict" style="color:{verdict_color}">
+            {verdict_icon} Profil global : {verdict.upper()}
+        </div>
+        <p>{escape(generate_summary(str(f["name"]), mode, scores, t))}</p>
+        <div class="muted">Confiance de l'analyse : <b>{confidence:.0f} %</b>
+            ({sum(x[1] for x in scores.values())}/{sum(x[2] for x in scores.values())}
+            indicateurs disponibles)
+        </div></div>"""
+        if valid_number(global_score)
+        else '<div class="decision">Données insuffisantes pour établir un score.</div>'
+    )
+    st.markdown(decision_html, unsafe_allow_html=True)
     st.markdown(f'<div class="decision"><div class="muted">Score global pondéré • Mode {escape(mode)}</div><div class="score">{global_score:.0f} / 100</div><div class="verdict" style="color:{verdict_color}">{verdict_icon} Profil global : {verdict.upper()}</div><p>{escape(generate_summary(str(f["name"]), mode, scores, t))}</p><div class="muted">Confiance de l’analyse : <b>{confidence:.0f} %</b> ({sum(x[1] for x in scores.values())}/{sum(x[2] for x in scores.values())} indicateurs disponibles)</div></div>' if valid_number(global_score) else '<div class="decision">Données insuffisantes pour établir un score.</div>', unsafe_allow_html=True)
     acols = st.columns(2)
     with acols[0]: st.markdown('<div class="card"><h3 class="good">✅ Arguments favorables</h3><ul>' + ''.join(f'<li>{escape(x)}</li>' for x in bulls) + ('<li class="muted">Aucun argument favorable vérifiable détecté.</li>' if not bulls else '') + '</ul></div>', unsafe_allow_html=True)
@@ -429,6 +447,8 @@ def main() -> None:
     st.markdown('<p class="disclaimer">⚠️ Analyse informative et déterministe — elle ne constitue pas un conseil financier.</p>', unsafe_allow_html=True)
     with st.sidebar:
         st.header("Paramètres"); raw = st.text_input("Ticker", "AAPL"); period_label = st.selectbox("Période affichée", list(PERIODS), 1)
+        mode = st.selectbox("Type d'analyse", ["Investisseur", "Trader / Swing"], help="Adapte les pondérations du score global.")
+        analyze = st.button("Lancer l'analyse", type="primary", use_container_width=True)
         mode = st.selectbox("Type d’analyse", ["Investisseur", "Trader / Swing"], help="Adapte les pondérations du score global.")
         analyze = st.button("Lancer l’analyse", type="primary", use_container_width=True)
     symbol = "".join(raw.split()).upper()
@@ -436,6 +456,13 @@ def main() -> None:
         if not symbol: st.error("Veuillez saisir un ticker valide.")
         else: load_stock_data.clear(); st.session_state["analysis"] = {"symbol":symbol,"period":PERIODS[period_label],"mode":mode}
     analysis = st.session_state.get("analysis")
+    if not analysis: st.info("Saisissez un ticker puis cliquez sur **Lancer l'analyse**."); return
+    try: render_dashboard(analysis["symbol"], analysis["period"], analysis["mode"])
+    except (ValueError, KeyError, IndexError, TypeError, ZeroDivisionError): st.error("Impossible d'analyser ce ticker. Vérifiez le symbole et les données disponibles.")
+    except Exception: st.error("Impossible d'analyser ce ticker. Vérifiez votre connexion Internet.")
+
+
+if __name__ == "__main__": main()
     if not analysis: st.info("Saisissez un ticker puis cliquez sur **Lancer l’analyse**."); return
     try: render_dashboard(analysis["symbol"], analysis["period"], analysis["mode"])
     except (ValueError, KeyError, IndexError, TypeError, ZeroDivisionError): st.error("Impossible d’analyser ce ticker. Vérifiez le symbole et les données disponibles.")
