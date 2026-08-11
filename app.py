@@ -207,6 +207,49 @@ def score_analysis(data: pd.DataFrame, info: dict[str, Any], mode: str) -> tuple
         else:
             text = f"P/E TTM de {float(pe):.1f}x → " + ("valorisation modérée selon les seuils du modèle." if pe <= 25 else "valorisation exigeante selon les seuils du modèle.")
             (favorable if pe <= 25 else unfavorable).append(text)
+    """Calcule cinq sous-scores explicables, puis les arguments associés."""
+    close = float(data["Close"].iloc[-1])
+    mm50, mm200 = data["MM50"].iloc[-1], data["MM200"].iloc[-1]
+    rsi, macd, signal = data["RSI"].iloc[-1], data["MACD"].iloc[-1], data["Signal"].iloc[-1]
+    pe, margin = info.get("trailingPE"), info.get("profitMargins")
+    revenue_growth, earnings_growth = info.get("revenueGrowth"), info.get("earningsGrowth")
+    roe, debt = info.get("returnOnEquity"), info.get("debtToEquity")
+    volatility = data["Close"].pct_change().std() * sqrt(252)
+
+    fundamentals = 50.0
+    fundamentals += 20 if valid_number(margin) and margin > 0.10 else (-15 if valid_number(margin) and margin < 0 else 0)
+    fundamentals += 15 if valid_number(roe) and roe > 0.12 else 0
+    fundamentals += 15 if valid_number(info.get("freeCashflow")) and info["freeCashflow"] > 0 else 0
+    valuation = 50.0
+    valuation += 30 if valid_number(pe) and 0 < pe < 20 else (-20 if valid_number(pe) and pe > 40 else 0)
+    valuation += 20 if valid_number(info.get("priceToBook")) and 0 < info["priceToBook"] < 3 else 0
+    growth = 50.0
+    growth += 25 if valid_number(revenue_growth) and revenue_growth > 0.08 else (-20 if valid_number(revenue_growth) and revenue_growth < 0 else 0)
+    growth += 25 if valid_number(earnings_growth) and earnings_growth > 0.08 else (-20 if valid_number(earnings_growth) and earnings_growth < 0 else 0)
+    technical = 50.0
+    technical += 15 if valid_number(mm50) and close > mm50 else -15
+    technical += 15 if valid_number(mm200) and close > mm200 else -15
+    technical += 10 if valid_number(macd) and valid_number(signal) and macd > signal else -10
+    technical += 10 if valid_number(rsi) and 40 <= rsi <= 65 else (-10 if valid_number(rsi) and rsi > 75 else 0)
+    risk = 75.0
+    risk -= 25 if valid_number(volatility) and volatility > 0.45 else (10 if valid_number(volatility) and volatility > 0.30 else 0)
+    risk -= 20 if valid_number(debt) and debt > 150 else 0
+    risk -= 10 if valid_number(info.get("beta")) and info["beta"] > 1.5 else 0
+
+    scores = {
+        "Fondamentaux": max(0, min(100, fundamentals)),
+        "Valorisation": max(0, min(100, valuation)),
+        "Croissance": max(0, min(100, growth)),
+        "Technique": max(0, min(100, technical)),
+        "Risque": max(0, min(100, risk)),
+    }
+    favorable, unfavorable = [], []
+    (favorable if valid_number(margin) and margin > 0.10 else unfavorable).append("Marge nette solide" if valid_number(margin) and margin > 0.10 else "Rentabilité à surveiller")
+    (favorable if valid_number(revenue_growth) and revenue_growth > 0 else unfavorable).append("Chiffre d'affaires en croissance" if valid_number(revenue_growth) and revenue_growth > 0 else "Croissance du CA faible ou négative")
+    (favorable if valid_number(mm200) and close > mm200 else unfavorable).append("Cours au-dessus de la MM200" if valid_number(mm200) and close > mm200 else "Cours sous la MM200")
+    (favorable if valid_number(macd) and valid_number(signal) and macd > signal else unfavorable).append("MACD au-dessus de son signal" if valid_number(macd) and valid_number(signal) and macd > signal else "Momentum MACD défavorable")
+    if valid_number(pe):
+        (favorable if 0 < pe < 25 else unfavorable).append("Valorisation P/E raisonnable" if 0 < pe < 25 else "P/E exigeant ou atypique")
     return scores, favorable, unfavorable
 
 
@@ -334,6 +377,23 @@ def render_dashboard(ticker: str, period: str, mode: str) -> None:
     metrics[3].metric("Croissance CA YoY", format_percentage(info.get("revenueGrowth")))
     metrics[4].metric("MM50", format_price(mm50, currency), f"Cours {format_percentage(distance_mm50)}")
     metrics[5].metric("MM200", format_price(mm200, currency), f"Cours {format_percentage(distance_mm200)}")
+    name = escape(str(info.get("longName") or info.get("shortName") or ticker))
+    scores, favorable, unfavorable = score_analysis(data, info, mode)
+    weights = WEIGHTS[mode]
+    global_score = sum(scores[key] * weights[key] for key in scores) / 100
+    known = sum(valid_number(info.get(key)) for key in ("trailingPE", "profitMargins", "revenueGrowth", "returnOnEquity", "beta", "debtToEquity"))
+    confidence = "Élevé" if known >= 5 and len(data) >= 200 else ("Modéré" if known >= 3 else "Limité")
+    verdict = "Configuration favorable" if global_score >= 70 else ("Profil équilibré / à surveiller" if global_score >= 50 else "Prudence recommandée")
+
+    st.title(f"{name} · {escape(ticker)}")
+    st.markdown(f"<div class='meta'>{escape(str(info.get('sector', 'Secteur non renseigné')))} · Mode {escape(mode)}</div>", unsafe_allow_html=True)
+    metrics = st.columns(6)
+    metrics[0].metric("Prix actuel", format_price(current, currency), format_percentage(daily_change))
+    metrics[1].metric("P/E", f"{float(info['trailingPE']):.1f}x" if valid_number(info.get("trailingPE")) else "N/D")
+    metrics[2].metric("Marge nette", format_percentage(info.get("profitMargins")))
+    metrics[3].metric("Croissance CA", format_percentage(info.get("revenueGrowth")))
+    metrics[4].metric("MM50", format_price(data["MM50"].iloc[-1], currency))
+    metrics[5].metric("MM200", format_price(data["MM200"].iloc[-1], currency))
 
     left, right = st.columns([1, 1.4])
     with left:
@@ -344,6 +404,7 @@ def render_dashboard(ticker: str, period: str, mode: str) -> None:
           <div class="score {color}">{global_score:.0f}<span style="font-size:1rem">/100</span></div>
           <div class="verdict">{escape(verdict)}</div>
           <div class="muted">Confiance : <b>{confidence_percent} % — {available_count}/{len(confidence_metrics)} indicateurs disponibles</b></div>
+          <div class="muted">Niveau de confiance : <b>{confidence}</b></div>
         </div>
         """, unsafe_allow_html=True)
     with right:
@@ -363,6 +424,17 @@ def render_dashboard(ticker: str, period: str, mode: str) -> None:
         ("Free Cash Flow (TTM)", format_large_amount(info.get("freeCashflow"), currency)),
         ("Croissance CA (YoY)", format_percentage(info.get("revenueGrowth"))),
         ("Croissance bénéfices (YoY)", format_percentage(info.get("earningsGrowth"))),
+    returns = data["Close"].pct_change().dropna()
+    volatility = returns.std() * sqrt(252)
+    high_52 = data["High"].tail(252).max()
+    low_52 = data["Low"].tail(252).min()
+    rsi, macd, signal = data["RSI"].iloc[-1], data["MACD"].iloc[-1], data["Signal"].iloc[-1]
+    stop_loss = current * (0.92 if mode == "Investisseur" else 0.96)
+    take_profit = current * (1.16 if mode == "Investisseur" else 1.08)
+    risk_reward = (take_profit - current) / (current - stop_loss)
+    fundamentals = [
+        ("ROE", format_percentage(info.get("returnOnEquity"))),
+        ("Free Cash Flow", format_price(info.get("freeCashflow"), currency)),
         ("Dette / capitaux propres", f"{float(info['debtToEquity']):.1f} %" if valid_number(info.get("debtToEquity")) else "N/D"),
         ("Price / Book", f"{float(info['priceToBook']):.1f}x" if valid_number(info.get("priceToBook")) else "N/D"),
     ]
@@ -407,6 +479,12 @@ def render_dashboard(ticker: str, period: str, mode: str) -> None:
       <div class="trade-row"><span>Take-Profit indicatif</span><span class="value good">{format_price(take_profit, currency)} ({format_percentage(take_profit/current-1, decimal=True)})</span></div>
       <div class="trade-row"><span>Ratio risque / récompense</span><span class="value">1 : {risk_reward:.1f}</span></div>
       <p class="disclaimer">Ces niveaux ne tiennent pas encore compte des supports techniques ni de l'ATR.</p>
+    summary = f"Le profil {mode.lower()} obtient {global_score:.0f}/100. {verdict}. Les niveaux ci-dessous sont indicatifs et doivent être adaptés à votre horizon, votre taille de position et votre tolérance au risque."
+    trade_rows = f"""
+      <p>{escape(summary)}</p>
+      <div class="trade-row"><span>Stop-Loss indicatif</span><span class="value bad">{format_price(stop_loss, currency)} ({format_percentage(stop_loss/current-1, decimal=True)})</span></div>
+      <div class="trade-row"><span>Take-Profit indicatif</span><span class="value good">{format_price(take_profit, currency)} ({format_percentage(take_profit/current-1, decimal=True)})</span></div>
+      <div class="trade-row"><span>Ratio risque / récompense</span><span class="value">1 : {risk_reward:.1f}</span></div>
     """
     st.markdown(f'<div class="decision">{trade_rows}</div>', unsafe_allow_html=True)
     st.markdown("<p class='disclaimer'>Information éducative uniquement : cette analyse automatisée ne constitue ni un conseil en investissement, ni une recommandation d'achat ou de vente. Les données peuvent être incomplètes ou différées.</p>", unsafe_allow_html=True)
