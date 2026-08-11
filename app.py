@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from html import escape
 from math import isfinite
+from datetime import datetime, timezone
+from html import escape
 from typing import Any
 
 import pandas as pd
@@ -77,6 +79,15 @@ def apply_styles() -> None:
             .detail-grid { grid-template-columns: 1fr; }
             .headline-price { font-size: 1.8rem; }
         }
+        .panel { background: #111c2f; border: 1px solid #25334a; border-radius: 14px;
+                 padding: 20px; margin-bottom: 14px; }
+        .badge { border-radius: 8px; font-weight: 800; letter-spacing: .04em;
+                 padding: 10px 12px; margin: 8px 0 15px; display: inline-block; }
+        .bull, .positive { color: #34d399; background: rgba(52, 211, 153, .10); }
+        .bear, .warning { color: #fb923c; background: rgba(251, 146, 60, .10); }
+        .neutral { color: #93c5fd; background: rgba(147, 197, 253, .10); }
+        .stop { color: #f87171; } .target { color: #34d399; }
+        .disclaimer { color: #94a3b8; font-size: .82rem; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -88,6 +99,8 @@ def valid_number(value: Any) -> bool:
     try:
         return value is not None and bool(pd.notna(value)) and isfinite(float(value))
     except (TypeError, ValueError, OverflowError):
+        return value is not None and pd.notna(value) and float(value) not in (float("inf"), float("-inf"))
+    except (TypeError, ValueError):
         return False
 
 
@@ -215,6 +228,7 @@ def render_dashboard(ticker_symbol: str, period: str) -> None:
         if valid_number(previous_close) and previous_close != 0
         else None
     )
+    daily_change = (current_price / float(history["Close"].iloc[-2]) - 1) if len(history) >= 2 else None
     latest_ma = history["MM200"].dropna()
     ma200 = float(latest_ma.iloc[-1]) if not latest_ma.empty else None
     ma_gap = (current_price / ma200 - 1) if valid_number(ma200) and ma200 != 0 else None
@@ -268,6 +282,10 @@ def render_dashboard(ticker_symbol: str, period: str) -> None:
     st.markdown(
         f"""
         <div class="analysis-grid">
+    left, right = st.columns(2, gap="small")
+    with left:
+        st.markdown(
+            f"""
             <div class="analysis-card">
                 <h3>Diagnostic</h3>
                 <div>
@@ -292,6 +310,13 @@ def render_dashboard(ticker_symbol: str, period: str) -> None:
                 <p class="compact-note">Lecture simplifiée fondée uniquement sur la marge nette
                 (&gt; 10 %) et le P/E (entre 0 et 25) ; ce n’est pas une conclusion d’investissement.</p>
             </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with right:
+        st.markdown(
+            f"""
             <div class="analysis-card">
                 <h3>Plan de Trading Suggéré</h3>
                 <div>
@@ -319,6 +344,45 @@ def render_dashboard(ticker_symbol: str, period: str) -> None:
         """,
         unsafe_allow_html=True,
     )
+            """,
+            unsafe_allow_html=True,
+        )
+    left, right = st.columns(2)
+    with left:
+        st.markdown('<div class="panel"><h3>Diagnostic</h3>', unsafe_allow_html=True)
+        if valid_number(ma200):
+            bullish = current_price > float(ma200)
+            trend, css_class = ("TENDANCE HAUSSIÈRE", "bull") if bullish else ("TENDANCE BAISSIÈRE", "bear")
+            st.markdown(f'<div class="badge {css_class}">{trend}</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="badge neutral">TENDANCE INDÉTERMINÉE</div>', unsafe_allow_html=True)
+        st.write(f"**Prix actuel :** {format_price(current_price, currency)}")
+        st.write(f"**MM200 actuelle :** {format_price(ma200, currency)}")
+        st.write(f"**Écart à la MM200 :** {format_percentage(ma_gap, signed=True)}")
+        diagnostic, diagnostic_class = get_fundamental_diagnostic(fundamentals["net_margin"], fundamentals["pe"])
+        st.markdown(f'<div class="badge {diagnostic_class}">{diagnostic}</div>', unsafe_allow_html=True)
+        st.caption("Lecture simplifiée fondée uniquement sur la marge nette (> 10 %) et le P/E (entre 0 et 25) ; ce n’est pas une conclusion d’investissement.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with right:
+        stop_loss = current_price * 0.93
+        take_profit = current_price * 1.15
+        risk = current_price - stop_loss
+        reward = take_profit - current_price
+        risk_reward = reward / risk if risk > 0 else None
+        ratio_class = "positive" if valid_number(risk_reward) and float(risk_reward) >= 2 else "neutral"
+        st.markdown('<div class="panel"><h3>Plan de Trading Suggéré</h3>', unsafe_allow_html=True)
+        st.write(f"**Entrée théorique :** {format_price(current_price, currency)}")
+        st.markdown(f'<p class="stop"><b>Stop-Loss (-7 %) :</b> {format_price(stop_loss, currency)}</p>', unsafe_allow_html=True)
+        st.markdown(f'<p class="target"><b>Take-Profit (+15 %) :</b> {format_price(take_profit, currency)}</p>', unsafe_allow_html=True)
+        ratio_label = f"1 : {risk_reward:.2f}" if valid_number(risk_reward) else "N/A"
+        st.markdown(
+            f'<div class="badge {ratio_class}">Risque / récompense&nbsp;: {ratio_label}</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(f'<div class="badge {ratio_class}">Risque / récompense&nbsp;: 1 : {risk_reward:.2f}</div>', unsafe_allow_html=True)
+        st.caption("Niveaux mécaniques et indicatifs, sans prise en compte de la volatilité, des frais ni de votre profil de risque.")
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 def main() -> None:
@@ -343,6 +407,8 @@ def main() -> None:
                 "ticker": ticker_symbol,
                 "period": PERIODS[period_label],
             }
+            st.session_state["analysis"] = {"ticker": ticker_symbol, "period": PERIODS[period_label],
+                                             "requested_at": datetime.now(timezone.utc).isoformat()}
 
     analysis = st.session_state.get("analysis")
     if not analysis:
