@@ -318,23 +318,6 @@ def build_comparison_snapshot(ticker: str, period: str, mode: str) -> dict[str, 
 
 def comparison_winner(metric: str, left: Any, right: Any, tickers: tuple[str, str]) -> str:
     """Détermine l'avantage selon la nature du critère, sans noter les absences."""
-    if metric in {"price", "daily_change"}:
-        return "—"
-    if metric in {"pe", "price_to_book"}:
-        left_positive = valid_number(left) and float(left) > 0
-        right_positive = valid_number(right) and float(right) > 0
-        if not left_positive and not right_positive:
-            return "—"
-        if not left_positive:
-            return f"🏆 {tickers[1]}"
-        if not right_positive:
-            return f"🏆 {tickers[0]}"
-        a, b = float(left), float(right)
-        if metric == "price_to_book" and abs(a - b) < 0.1:
-            return "⚖️ Égalité"
-        if abs(a - b) < 1e-12:
-            return "⚖️ Égalité"
-        return f"🏆 {tickers[0] if a < b else tickers[1]}"
     if metric == "price":
         return "—"
     if not valid_number(left) and not valid_number(right):
@@ -344,7 +327,6 @@ def comparison_winner(metric: str, left: Any, right: Any, tickers: tuple[str, st
     if not valid_number(right):
         return f"🏆 {tickers[0]}"
     a, b = float(left), float(right)
-    if metric == "volatility":
     if metric in {"pe", "price_to_book"}:
         if a <= 0 and b <= 0:
             return "—"
