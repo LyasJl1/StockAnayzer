@@ -109,6 +109,17 @@ def tier_score(value: Any, tiers: tuple[tuple[float, float], ...], default: floa
     return default
 
 
+def tier_score(value: Any, tiers: tuple[tuple[float, float], ...], default: float) -> float | None:
+    """Retourne le score du premier seuil atteint, sans noter une donnée absente."""
+    if not valid_number(value):
+        return None
+    number = float(value)
+    for upper_bound, score in tiers:
+        if number <= upper_bound:
+            return score
+    return default
+
+
 def average_available(*scores: float | None) -> float:
     available = [score for score in scores if score is not None]
     return sum(available) / len(available) if available else 50.0
@@ -473,6 +484,17 @@ def render_dashboard(ticker: str, period: str, mode: str) -> None:
         info.get("revenueGrowth"), distance_mm50, distance_mm200, position_52w,
     )
     trade_rows = f"""
+  <p>{escape(summary)}</p>
+  <h3>Plan mécanique</h3>
+  <div class="trade-row"><span>Stop-Loss indicatif</span><span class="value bad">{format_price(stop_loss, currency)} ({format_percentage(stop_loss/current-1, decimal=True)})</span></div>
+  <div class="trade-row"><span>Take-Profit indicatif</span><span class="value good">{format_price(take_profit, currency)} ({format_percentage(take_profit/current-1, decimal=True)})</span></div>
+  <div class="trade-row"><span>Ratio risque / récompense</span><span class="value">1 : {risk_reward:.1f}</span></div>
+  <p class="disclaimer">Ces niveaux ne tiennent pas encore compte des supports techniques ni de l'ATR.</p>
+    """
+    st.markdown(
+        f'<div class="decision">{trade_rows}</div>',
+        unsafe_allow_html=True,
+    )
       <p>{escape(summary)}</p>
       <h3>Plan mécanique</h3>
       <div class="trade-row"><span>Stop-Loss indicatif</span><span class="value bad">{format_price(stop_loss, currency)} ({format_percentage(stop_loss/current-1, decimal=True)})</span></div>
