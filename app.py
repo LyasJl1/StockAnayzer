@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timezone
 from html import escape
 from math import isfinite, sqrt
@@ -12,9 +13,11 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+from google import genai
 
 
 PERIODS = {"6 mois": "6mo", "1 an": "1y", "2 ans": "2y", "5 ans": "5y"}
+GEMINI_MODEL = "gemini-3.5-flash"
 WEIGHTS = {
     "Investisseur": {"Fondamentaux": 25, "Valorisation": 20, "Croissance": 20, "Technique": 20, "Risque": 15},
     "Trader / Swing": {"Fondamentaux": 15, "Valorisation": 10, "Croissance": 15, "Technique": 40, "Risque": 20},
@@ -280,6 +283,143 @@ def render_key_events(events: dict[str, Any], currency_symbol: str) -> None:
             unsafe_allow_html=True,
         )
     st.markdown('<p class="disclaimer">Données événementielles fournies par Yahoo Finance et susceptibles d’être modifiées.</p>', unsafe_allow_html=True)
+
+
+def build_ai_snapshot(
+    ticker: str,
+    company_name: str,
+    mode: str,
+    global_score: float,
+    verdict: str,
+    scores: dict[str, float],
+    info: dict[str, Any],
+    current: float,
+    rsi: Any,
+    macd: Any,
+    signal: Any,
+    volatility: Any,
+    distance_mm50: float | None,
+    distance_mm200: float | None,
+    position_52w: float | None,
+    events: dict[str, Any],
+) -> dict[str, Any]:
+    """Construit l'instantané IA uniquement avec les métriques déjà calculées."""
+
+    def available(values: dict[str, Any]) -> dict[str, Any]:
+        return {
+            label: float(value) if valid_number(value) else value
+            for label, value in values.items()
+            if valid_number(value) or isinstance(value, (str, date)) and bool(value)
+        }
+
+    earnings_dates = events.get("earnings_dates") or []
+    next_earnings = earnings_dates[0] if earnings_dates else None
+    snapshot: dict[str, Any] = {
+        "ticker": ticker,
+        "nom_entreprise": company_name,
+        "profil": mode,
+        "score_global_sur_100": float(global_score),
+        "verdict": verdict,
+        "scores_sur_100": available({
+            "Fondamentaux": scores.get("Fondamentaux"),
+            "Valorisation": scores.get("Valorisation"),
+            "Croissance": scores.get("Croissance"),
+            "Technique": scores.get("Technique"),
+            "Risque": scores.get("Risque"),
+        }),
+        "fondamentaux": available({
+            "PE": info.get("trailingPE"),
+            "marge_nette_ratio": info.get("profitMargins"),
+            "croissance_CA_YoY_ratio": info.get("revenueGrowth"),
+            "croissance_benefices_YoY_ratio": info.get("earningsGrowth"),
+            "ROE_ratio": info.get("returnOnEquity"),
+            "free_cash_flow": info.get("freeCashflow"),
+            "dette_sur_capitaux_propres": info.get("debtToEquity"),
+            "price_to_book": info.get("priceToBook"),
+        }),
+        "technique": available({
+            "prix_actuel": current,
+            "RSI": rsi,
+            "MACD": macd,
+            "signal_MACD": signal,
+            "volatilite_annualisee_ratio": volatility,
+            "distance_MM50_ratio": distance_mm50,
+            "distance_MM200_ratio": distance_mm200,
+            "position_fourchette_52_semaines_ratio": position_52w,
+        }),
+        "evenements": available({
+            "prochaine_date_resultats": next_earnings,
+            "jours_avant_resultats": events.get("days_until_earnings"),
+            "rendement_dividende_ratio": events.get("dividend_yield"),
+            "date_ex_dividende": events.get("ex_dividend_date"),
+        }),
+    }
+    return {key: value for key, value in snapshot.items() if value not in ({}, None, "")}
+
+
+def generate_ai_opinion(snapshot: dict[str, Any], api_key: str) -> str:
+    """Demande à Gemini d'expliquer l'instantané, sans enrichissement externe."""
+    prompt = """Tu es un assistant pédagogique d'analyse financière.
+
+Analyse UNIQUEMENT les métriques fournies ci-dessous. Tu n'as pas le droit :
+- d'inventer une information absente
+- d'utiliser une information externe
+- de modifier les chiffres
+- de prédire avec certitude l'évolution du cours
+- de dire « achetez », « vendez », « il faut acheter » ou « il faut vendre »
+- de présenter cette analyse comme un conseil financier
+
+Réponds en français. Produis exactement 3 points courts :
+✅ Point rassurant : explique la principale force visible dans les données.
+⚠️ Point d'attention : explique le principal risque ou la principale faiblesse visible.
+🧭 Lecture clé : explique comment interpréter l'ensemble de manière équilibrée.
+
+Chaque point doit citer au moins une métrique réelle fournie lorsqu'une métrique
+pertinente est disponible. Maximum environ 80 mots au total. Si certaines données
+sont manquantes, ignore-les. Ne les invente jamais.
+
+Données :
+""" + json.dumps(snapshot, ensure_ascii=False, default=str, allow_nan=False)
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+        text = getattr(response, "text", None)
+        return text.strip() if isinstance(text, str) else ""
+    except Exception:
+        return ""
+
+
+def render_ai_opinion(snapshot: dict[str, Any], ticker: str, mode: str, period: str) -> None:
+    """Affiche et mémorise l'avis IA propre à l'analyse courante."""
+    st.subheader("💡 L'Avis de l'IA")
+    state_key = f"ai_opinion_{ticker}_{mode}_{period}"
+    try:
+        api_key = st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        api_key = None
+
+    with st.container(border=True):
+        st.markdown("### 💡 Analyse IA")
+        opinion = st.session_state.get(state_key)
+        if opinion:
+            st.markdown(opinion)
+            st.markdown(
+                '<p class="disclaimer">Cette synthèse est générée automatiquement à partir des métriques '
+                'affichées. Elle peut contenir des erreurs et ne constitue pas un conseil en investissement.</p>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown("Gemini peut synthétiser les données calculées ci-dessus.")
+            if not api_key:
+                st.info("Configurez GEMINI_API_KEY dans les secrets Streamlit pour activer l'analyse IA.")
+            elif st.button("✨ Générer l'avis IA", key=f"generate_{state_key}"):
+                with st.spinner("Analyse IA en cours…"):
+                    opinion = generate_ai_opinion(snapshot, str(api_key))
+                if opinion:
+                    st.session_state[state_key] = opinion
+                    st.rerun()
+                else:
+                    st.error("Impossible de générer l'analyse IA pour le moment.")
 
 
 def tier_score(value: Any, tiers: tuple[tuple[float, float], ...], default: float) -> float | None:
@@ -637,7 +777,8 @@ def render_dashboard(ticker: str, period: str, mode: str) -> None:
     currency = CURRENCY_SYMBOLS.get(str(info.get("currency", "USD")), f"{info.get('currency', 'USD')} ")
     currency_code = str(info.get("currency") or "Devise N/D")
     exchange = str(info.get("fullExchangeName") or info.get("exchange") or "Place N/D")
-    name = escape(str(info.get("longName") or info.get("shortName") or ticker))
+    company_name = str(info.get("longName") or info.get("shortName") or ticker)
+    name = escape(company_name)
     mm50, mm200 = data["MM50"].iloc[-1], data["MM200"].iloc[-1]
     distance_mm50 = current / float(mm50) - 1 if valid_number(mm50) and mm50 else None
     distance_mm200 = current / float(mm200) - 1 if valid_number(mm200) and mm200 else None
@@ -735,7 +876,14 @@ def render_dashboard(ticker: str, period: str, mode: str) -> None:
         items = "".join(f'<li>{escape(item)}</li>' for item in unfavorable) or "<li>Aucun signal défavorable majeur détecté</li>"
         st.markdown(f'<div class="card"><h3 class="bad">Arguments défavorables</h3><ul>{items}</ul></div>', unsafe_allow_html=True)
 
-    render_key_events(get_key_events(ticker, info), currency)
+    events = get_key_events(ticker, info)
+    render_key_events(events, currency)
+    ai_snapshot = build_ai_snapshot(
+        ticker, company_name, mode, global_score, verdict, scores, info, current,
+        rsi, macd, signal, volatility, distance_mm50, distance_mm200, position_52w,
+        events,
+    )
+    render_ai_opinion(ai_snapshot, ticker, mode, period)
 
     st.subheader("Synthèse d'aide à la décision")
     summary = build_summary(
