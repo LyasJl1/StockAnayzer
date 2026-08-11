@@ -8,6 +8,8 @@ Application web Streamlit d'analyse d'actions. À partir d'un ticker Yahoo Finan
 - des arguments favorables et des risques justifiés par les valeurs réellement disponibles ;
 - le cours, les MM50/MM200, le RSI, le MACD et la volatilité historique ;
 - un diagnostic pédagogique de tendance, de valorisation, de croissance et de risque ;
+- le cours et sa moyenne mobile à 200 séances (MM200) sur un graphique interactif ;
+- un diagnostic pédagogique de tendance et de fondamentaux ;
 - un plan indicatif avec prix d'entrée, Stop-Loss, Take-Profit et ratio
   risque/récompense.
 
