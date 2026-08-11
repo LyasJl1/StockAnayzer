@@ -39,6 +39,43 @@ def apply_styles() -> None:
         }
         [data-testid="stMetricValue"] { color: #f8fafc; }
         .company-meta { color: #94a3b8; margin-top: -0.7rem; margin-bottom: 1.3rem; }
+        .analysis-card {
+            background: #111c2f; border: 1px solid #25334a; border-radius: 14px;
+            padding: 18px; min-height: 370px; box-sizing: border-box;
+            display: flex; flex-direction: column; gap: 12px;
+        }
+        .analysis-card h3 { color: #f8fafc; font-size: 1.1rem; margin: 0; }
+        .section-label { color: #94a3b8; font-size: .72rem; font-weight: 700;
+                         letter-spacing: .09em; margin-bottom: 3px; text-transform: uppercase; }
+        .headline-price { color: #f8fafc; font-size: clamp(1.75rem, 3vw, 2.35rem);
+                          font-weight: 750; line-height: 1.05; }
+        .badge { border-radius: 8px; font-weight: 800; letter-spacing: .04em;
+                 padding: 9px 11px; display: block; width: fit-content; }
+        .bull, .positive { color: #34d399; background: rgba(52, 211, 153, .10); }
+        .bear, .warning { color: #fb923c; background: rgba(251, 146, 60, .10); }
+        .neutral { color: #93c5fd; background: rgba(147, 197, 253, .10); }
+        .detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+                       gap: 8px; }
+        .detail-item { background: #0d1728; border-radius: 9px; padding: 10px 11px; }
+        .detail-label { color: #94a3b8; display: block; font-size: .73rem; margin-bottom: 3px; }
+        .detail-value { color: #e5e7eb; font-size: .98rem; font-weight: 700; }
+        .fundamental-card { background: #0d1728; border: 1px solid #25334a;
+                            border-radius: 10px; padding: 12px; }
+        .fundamental-card .badge { margin-top: 7px; }
+        .trade-row { align-items: center; border-bottom: 1px solid #25334a;
+                     display: flex; justify-content: space-between; gap: 12px; padding: 8px 0; }
+        .trade-row:last-of-type { border-bottom: 0; }
+        .trade-label { color: #94a3b8; font-size: .86rem; }
+        .trade-value { color: #f8fafc; font-weight: 750; text-align: right; }
+        .stop { color: #f87171; } .target { color: #34d399; }
+        .compact-note { color: #94a3b8; font-size: .73rem; line-height: 1.35;
+                        margin: auto 0 0; }
+        .disclaimer { color: #94a3b8; font-size: .82rem; }
+        @media (max-width: 768px) {
+            .analysis-card { min-height: auto; padding: 15px; }
+            .detail-grid { grid-template-columns: 1fr; }
+            .headline-price { font-size: 1.8rem; }
+        }
         .panel { background: #111c2f; border: 1px solid #25334a; border-radius: 14px;
                  padding: 20px; margin-bottom: 14px; }
         .badge { border-radius: 8px; font-weight: 800; letter-spacing: .04em;
@@ -212,6 +249,92 @@ def render_dashboard(ticker_symbol: str, period: str) -> None:
         st.warning("Historique insuffisant pour calculer une MM200 fiable (200 séances requises).")
 
     st.subheader("Diagnostic & Plan de Trading")
+    if valid_number(ma200):
+        bullish = current_price > float(ma200)
+        trend, trend_class = (
+            ("TENDANCE HAUSSIÈRE", "bull")
+            if bullish
+            else ("TENDANCE BAISSIÈRE", "bear")
+        )
+    else:
+        trend, trend_class = "TENDANCE INDÉTERMINÉE", "neutral"
+
+    diagnostic, diagnostic_class = get_fundamental_diagnostic(
+        fundamentals["net_margin"], fundamentals["pe"]
+    )
+    stop_loss = current_price * 0.93
+    take_profit = current_price * 1.15
+    risk = current_price - stop_loss
+    reward = take_profit - current_price
+    risk_reward = reward / risk if risk > 0 else None
+    ratio_class = (
+        "positive"
+        if valid_number(risk_reward) and float(risk_reward) >= 2
+        else "neutral"
+    )
+    ratio_label = f"1 : {risk_reward:.2f}" if valid_number(risk_reward) else "N/A"
+
+    left, right = st.columns(2, gap="small")
+    with left:
+        st.markdown(
+            f"""
+            <div class="analysis-card">
+                <h3>Diagnostic</h3>
+                <div>
+                    <div class="section-label">Prix actuel</div>
+                    <div class="headline-price">{format_price(current_price, currency)}</div>
+                </div>
+                <div class="badge {trend_class}">{trend}</div>
+                <div class="detail-grid">
+                    <div class="detail-item">
+                        <span class="detail-label">MM200 actuelle</span>
+                        <span class="detail-value">{format_price(ma200, currency)}</span>
+                    </div>
+                    <div class="detail-item">
+                        <span class="detail-label">Écart à la MM200</span>
+                        <span class="detail-value">{format_percentage(ma_gap, signed=True)}</span>
+                    </div>
+                </div>
+                <div class="fundamental-card">
+                    <div class="section-label">Diagnostic fondamental</div>
+                    <div class="badge {diagnostic_class}">{diagnostic}</div>
+                </div>
+                <p class="compact-note">Lecture simplifiée fondée uniquement sur la marge nette
+                (&gt; 10 %) et le P/E (entre 0 et 25) ; ce n’est pas une conclusion d’investissement.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with right:
+        st.markdown(
+            f"""
+            <div class="analysis-card">
+                <h3>Plan de Trading Suggéré</h3>
+                <div>
+                    <div class="trade-row">
+                        <span class="trade-label">Entrée théorique</span>
+                        <span class="trade-value">{format_price(current_price, currency)}</span>
+                    </div>
+                    <div class="trade-row">
+                        <span class="trade-label">Stop-Loss (-7 %)</span>
+                        <span class="trade-value stop">{format_price(stop_loss, currency)}</span>
+                    </div>
+                    <div class="trade-row">
+                        <span class="trade-label">Take-Profit (+15 %)</span>
+                        <span class="trade-value target">{format_price(take_profit, currency)}</span>
+                    </div>
+                </div>
+                <div>
+                    <div class="section-label">Ratio risque / récompense</div>
+                    <div class="badge {ratio_class}">{ratio_label}</div>
+                </div>
+                <p class="compact-note">Niveaux mécaniques et indicatifs, sans prise en compte de
+                la volatilité, des frais ni de votre profil de risque.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
     left, right = st.columns(2)
     with left:
         st.markdown('<div class="panel"><h3>Diagnostic</h3>', unsafe_allow_html=True)
