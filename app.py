@@ -50,6 +50,10 @@ def apply_styles() -> None:
     .score { font-size:clamp(2.2rem,5vw,3.5rem); font-weight:800; line-height:1; color:#f8fafc; }
     .verdict { font-size:1.1rem; font-weight:800; letter-spacing:.04em; margin:.5rem 0; }
     .cards { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; align-items:stretch; }
+    .card,.analysis-card { background:#111c2f; border:1px solid #25334a; border-radius:14px; padding:16px; }
+    .analysis-card { min-height:100%; box-sizing:border-box; }
+    .card h3,.analysis-card h3 { margin:0 0 12px; font-size:1.05rem; }
+    .card ul { padding-left:1.15rem; margin:.3rem 0; }
     .card { background:#111c2f; border:1px solid #25334a; border-radius:14px; padding:16px; }
     .card h3 { margin:0 0 12px; font-size:1.05rem; } .card ul { padding-left:1.15rem; margin:.3rem 0; }
     .card li { margin:.55rem 0; line-height:1.4; } .good { color:#34d399; } .warn { color:#fb923c; }
@@ -435,6 +439,7 @@ def render_dashboard(symbol: str, period: str, mode: str) -> None:
     with left:
         st.markdown(
             f"""
+            <div class="analysis-card">
             <div class="card">
                 <h3>Lecture technique</h3>
                 <p>{tech_text}</p>
@@ -460,6 +465,7 @@ def render_dashboard(symbol: str, period: str, mode: str) -> None:
     with right:
         st.markdown(
             f"""
+            <div class="analysis-card">
             <div class="card">
                 <h3>Plan de Trading Suggéré</h3>
                 <div class="trade-row"><span>Entrée théorique</span>
