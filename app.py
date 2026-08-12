@@ -920,6 +920,240 @@ def calculate_pullback_timing_series(data: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def _v3_prepared(data: pd.DataFrame) -> pd.DataFrame:
+    """Retourne les indicateurs nécessaires à V3 sans modifier la série source."""
+    if data.empty or "Close" not in data:
+        return pd.DataFrame()
+    required = {"MM50", "MM200", "RSI", "MACD", "Signal"}
+    frame = data.copy() if required.issubset(data.columns) else calculate_indicators(data)
+    if "ATR14" not in frame:
+        frame["ATR14"] = calculate_atr(frame)
+    return frame
+
+
+def _v3_condition(key: str, label: str, available: bool, passed: bool = False,
+                  detail: str = "", points: float = 0, maximum: float = 0) -> dict[str, Any]:
+    return {"key": key, "label": label, "available": bool(available),
+            "passed": bool(passed) if available else False, "detail": detail,
+            "points": float(points) if available else None, "max": maximum}
+
+
+def evaluate_v3_regime(data: pd.DataFrame) -> dict[str, Any]:
+    """Évalue le contexte long terme à la dernière date disponible, causalement."""
+    frame = _v3_prepared(data)
+    if frame.empty:
+        return {"status": "N/D", "conditions": [], "score": 0, "available_points": 0,
+                "volatility": None, "volatility_class": "N/D", "extended": False}
+    row = frame.iloc[-1]
+    close, mm50, mm200 = row.get("Close"), row.get("MM50"), row.get("MM200")
+    old_mm200 = frame["MM200"].iloc[-21] if len(frame) >= 21 else None
+    specifications = (
+        ("price_above_mm200", "Cours > MM200", close, mm200, 15),
+        ("mm50_above_mm200", "MM50 > MM200", mm50, mm200, 15),
+        ("mm200_rising", "MM200 montante sur 20 séances", mm200, old_mm200, 10),
+    )
+    conditions = []
+    for key, label, left, right, maximum in specifications:
+        available = valid_number(left) and valid_number(right)
+        passed = available and float(left) > float(right)
+        conditions.append(_v3_condition(key, label, available, passed,
+                                         "validée" if passed else "non validée", maximum if passed else 0, maximum))
+    returns = frame["Close"].pct_change().dropna().tail(252)
+    volatility = returns.std() * sqrt(252) if len(returns) >= 20 else None
+    if valid_number(volatility):
+        volatility_class = ("favorable" if volatility < .25 else "acceptable" if volatility <= .40
+                            else "prudence" if volatility <= .55 else "défavorable")
+    else:
+        volatility_class = "N/D"
+    conditions.append(_v3_condition("volatility", "Volatilité du régime", valid_number(volatility),
+                                     valid_number(volatility) and volatility <= .40,
+                                     f"{float(volatility):.1%} — {volatility_class}" if valid_number(volatility) else "N/D"))
+    distance_200 = float(close) / float(mm200) - 1 if valid_number(close) and valid_number(mm200) and mm200 else None
+    distance_50 = float(close) / float(mm50) - 1 if valid_number(close) and valid_number(mm50) and mm50 else None
+    extended = bool((distance_200 is not None and distance_200 > .35) or
+                    (distance_50 is not None and distance_50 > .20))
+    conditions.append(_v3_condition("extension", "Absence d'extension extrême", distance_50 is not None or distance_200 is not None,
+                                     not extended, "⚠️ Tendance haussière mais cours fortement étendu." if extended else "Extension acceptable"))
+    core = conditions[:3]
+    available_core = [condition for condition in core if condition["available"]]
+    ratio = sum(condition["passed"] for condition in available_core) / len(available_core) if available_core else None
+    status = "N/D" if ratio is None else "Favorable" if ratio >= 1 else "Mitigé" if ratio >= 2 / 3 else "Défavorable"
+    return {"status": status, "conditions": conditions,
+            "score": sum(condition["points"] or 0 for condition in core),
+            "available_points": sum(condition["max"] for condition in core if condition["available"]),
+            "volatility": float(volatility) if valid_number(volatility) else None,
+            "volatility_class": volatility_class, "extended": extended,
+            "distance_mm50": distance_50, "distance_mm200": distance_200}
+
+
+def evaluate_v3_setup(data: pd.DataFrame, regime: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Cherche un repli surveillable ; ce résultat ne constitue jamais une entrée."""
+    frame = _v3_prepared(data)
+    if frame.empty:
+        return {"status": "N/D", "conditions": [], "score": 0, "available_points": 0}
+    regime = regime or evaluate_v3_regime(frame)
+    row = frame.iloc[-1]
+    close, mm50, rsi, atr = row.get("Close"), row.get("MM50"), row.get("RSI"), row.get("ATR14")
+    distance = float(close) / float(mm50) - 1 if valid_number(close) and valid_number(mm50) and mm50 else None
+    atr_distance = abs(float(close) - float(mm50)) / float(atr) if all(valid_number(x) for x in (close, mm50, atr)) and atr > 0 else None
+    distance_points = 15 if distance is not None and -.05 <= distance <= .03 else 9 if distance is not None and -.08 <= distance < -.05 else 6 if distance is not None and .03 < distance <= .08 else 0
+    rsi_points = 10 if valid_number(rsi) and 38 <= rsi <= 50 else 6 if valid_number(rsi) and 32 <= rsi <= 55 else 0
+    atr_points = 5 if atr_distance is not None and atr_distance <= 1 else 3 if atr_distance is not None and atr_distance <= 2 else 0
+    conditions = [
+        _v3_condition("distance_mm50", "Cours proche MM50", distance is not None,
+                      distance is not None and -.05 <= distance <= .03,
+                      f"{distance:+.1%}" if distance is not None else "N/D", distance_points, 15),
+        _v3_condition("rsi_setup", "RSI de détente", valid_number(rsi),
+                      valid_number(rsi) and 35 <= rsi <= 52,
+                      f"RSI {float(rsi):.1f}" if valid_number(rsi) else "N/D", rsi_points, 10),
+        _v3_condition("atr_proximity", "Distance à la MM50 en ATR", atr_distance is not None,
+                      atr_distance is not None and atr_distance <= 2,
+                      f"{atr_distance:.1f} ATR" if atr_distance is not None else "N/D", atr_points, 5),
+        _v3_condition("support", "Support récent", False, detail="Support N/D (ignoré dans le backtest causal)"),
+    ]
+    context_ok = regime["status"] in {"Favorable", "Mitigé"}
+    present = (context_ok and distance is not None and -.05 <= distance <= .03 and
+               valid_number(rsi) and 35 <= rsi <= 52 and not regime.get("extended", False))
+    convergence = sum(condition["passed"] for condition in conditions[:3] if condition["available"])
+    status = "Présent" if present else "Possible" if context_ok and convergence >= 2 and not regime.get("extended", False) else "Absent"
+    if not any(condition["available"] for condition in conditions[:3]):
+        status = "N/D"
+    return {"status": status, "conditions": conditions,
+            "score": distance_points + rsi_points + atr_points,
+            "available_points": sum(condition["max"] for condition in conditions if condition["available"]),
+            "distance_mm50": distance, "atr_distance": atr_distance, "rsi": float(rsi) if valid_number(rsi) else None}
+
+
+def evaluate_v3_trigger(data: pd.DataFrame) -> dict[str, Any]:
+    """Détecte une reprise à T exclusivement à partir de T et de séances passées."""
+    frame = _v3_prepared(data)
+    if frame.empty:
+        return {"status": "N/D", "conditions": [], "score": 0, "available_points": 0}
+    row = frame.iloc[-1]
+    close, rsi, macd, signal, mm50 = (row.get(key) for key in ("Close", "RSI", "MACD", "Signal", "MM50"))
+    previous = lambda column, periods: frame[column].iloc[-periods - 1] if column in frame and len(frame) > periods else None
+    gap = macd - signal if valid_number(macd) and valid_number(signal) else None
+    gap3_values = (previous("MACD", 3), previous("Signal", 3))
+    gap5_values = (previous("MACD", 5), previous("Signal", 5))
+    gap3 = gap3_values[0] - gap3_values[1] if all(valid_number(x) for x in gap3_values) else None
+    gap5 = gap5_values[0] - gap5_values[1] if all(valid_number(x) for x in gap5_values) else None
+    prior_below = None
+    if len(frame) >= 2 and {"Close", "MM50"}.issubset(frame.columns):
+        prior = frame.iloc[max(0, len(frame) - 6):-1]
+        available_prior = prior["Close"].notna() & prior["MM50"].notna()
+        if available_prior.any():
+            prior_below = bool((prior.loc[available_prior, "Close"] < prior.loc[available_prior, "MM50"]).any())
+    definitions = [
+        ("price_recovery", "Cours en reprise", all(valid_number(x) for x in (close, previous("Close", 3), previous("Close", 1))),
+         valid_number(close) and valid_number(previous("Close", 3)) and valid_number(previous("Close", 1)) and close > previous("Close", 3) and close > previous("Close", 1), 7),
+        ("rsi_improving", "RSI en amélioration", valid_number(rsi) and valid_number(previous("RSI", 3)),
+         valid_number(rsi) and valid_number(previous("RSI", 3)) and rsi > previous("RSI", 3) and rsi >= 42, 6),
+        ("macd_gap_improving", "MACD gap en amélioration", all(valid_number(x) for x in (gap, gap3, gap5)),
+         all(valid_number(x) for x in (gap, gap3, gap5)) and gap > gap3 and gap > gap5, 7),
+        ("macd_cross", "MACD > signal", valid_number(macd) and valid_number(signal),
+         valid_number(macd) and valid_number(signal) and macd > signal, 5),
+        ("mm50_reclaim", "Reprise de la MM50", valid_number(close) and valid_number(mm50) and prior_below is not None,
+         valid_number(close) and valid_number(mm50) and close > mm50 and prior_below is True, 5),
+    ]
+    conditions = [_v3_condition(key, label, available, passed,
+                                "validé" if passed else "non validé", maximum if passed else 0, maximum)
+                  for key, label, available, passed, maximum in definitions]
+    available = [condition for condition in conditions if condition["available"]]
+    passed = sum(condition["passed"] for condition in available)
+    status = "N/D" if not available else "Fort" if passed >= 3 else "Partiel" if passed >= 1 else "Absent"
+    return {"status": status, "conditions": conditions, "validated": passed,
+            "score": sum(condition["points"] or 0 for condition in conditions),
+            "available_points": sum(condition["max"] for condition in available)}
+
+
+def build_v3_entry_status(regime: dict[str, Any], setup: dict[str, Any],
+                          trigger: dict[str, Any]) -> str:
+    """Traduit les trois états V3 en une décision lisible, sans score principal."""
+    r, s, t = regime.get("status"), setup.get("status"), trigger.get("status")
+    if r == "Défavorable": return "🔴 Régime défavorable — aucune entrée V3"
+    if r == "Favorable" and s == "Présent" and t == "Fort": return "🟢 Configuration d'entrée techniquement confirmée"
+    if r == "Favorable" and s == "Présent" and t == "Partiel": return "🟠 Setup intéressant — confirmation en cours"
+    if r == "Favorable" and s == "Présent" and t == "Absent": return "🟠 Setup intéressant — attendre le déclencheur"
+    if r == "Favorable" and s == "Absent": return "⚪ Tendance saine — pas de setup d'entrée actuellement"
+    if r == "Mitigé" and s == "Présent" and t == "Fort": return "🟡 Reprise détectée dans un contexte encore mitigé"
+    if "N/D" in {r, s, t}: return "⚪ V3 non déterminable — données insuffisantes"
+    return "🟡 Configuration incomplète — rester sélectif"
+
+
+def calculate_rigorous_entry_v3(data: pd.DataFrame) -> dict[str, Any]:
+    """Calcule V3 à la dernière séance : régime, setup, trigger, puis indice technique."""
+    regime = evaluate_v3_regime(data)
+    setup = evaluate_v3_setup(data, regime)
+    trigger = evaluate_v3_trigger(data)
+    strength = regime["score"] + setup["score"] + trigger["score"]
+    if regime["status"] == "Défavorable":
+        strength = min(strength, 55)
+    conditions = [{**condition, "stage": stage} for stage, result in
+                  (("Régime", regime), ("Setup", setup), ("Trigger", trigger))
+                  for condition in result["conditions"]]
+    return {"regime": regime, "setup": setup, "trigger": trigger,
+            "status": build_v3_entry_status(regime, setup, trigger), "conditions": conditions,
+            "metrics": {"v3_signal_strength": float(strength),
+                        "available_points": regime["available_points"] + setup["available_points"] + trigger["available_points"]}}
+
+
+def calculate_v3_timing_series(data: pd.DataFrame) -> pd.DataFrame:
+    """Construit les états V3 causaux et les événements Early / Confirmed."""
+    frame = _v3_prepared(data)
+    rows = []
+    for position in range(len(frame)):
+        result = calculate_rigorous_entry_v3(frame.iloc[:position + 1])
+        rows.append({"date": frame.index[position], "close": frame["Close"].iloc[position],
+                     "regime_status": result["regime"]["status"], "setup_status": result["setup"]["status"],
+                     "trigger_status": result["trigger"]["status"],
+                     "v3_signal_strength": result["metrics"]["v3_signal_strength"], "_position": position})
+    series = pd.DataFrame(rows, index=frame.index)
+    eligible = (series["regime_status"] == "Favorable") & (series["setup_status"] == "Présent")
+    early_state = eligible & (series["trigger_status"] == "Partiel")
+    confirmed_state = eligible & (series["trigger_status"] == "Fort")
+    series["v3_early"] = early_state & ~early_state.shift(1, fill_value=False)
+    series["v3_confirmed"] = confirmed_state & ~confirmed_state.shift(1, fill_value=False)
+    return series
+
+
+def extract_v3_signals(series: pd.DataFrame, signal_type: str,
+                       min_gap: int = MIN_SIGNAL_GAP) -> pd.DataFrame:
+    """Extrait uniquement les transitions d'état V3, puis applique l'espacement partagé."""
+    column = "v3_early" if signal_type.lower() == "early" else "v3_confirmed"
+    if series.empty or column not in series:
+        return series.iloc[0:0].copy()
+    candidates = series.loc[series[column].fillna(False)].copy()
+    kept, last = [], None
+    for position in candidates["_position"].astype(int):
+        if last is None or position - last >= min_gap:
+            kept.append(position); last = position
+    return candidates[candidates["_position"].isin(kept)]
+
+
+def analyze_v3_confirmations(early: pd.DataFrame, confirmed: pd.DataFrame,
+                             timeline: pd.DataFrame, window: int = 15) -> dict[str, Any]:
+    """Associe chaque Early au premier Confirmed suivant, sans prétention prédictive."""
+    confirmed_positions = confirmed.get("_position", pd.Series(dtype=int)).astype(int).tolist()
+    closes = timeline["close"].reset_index(drop=True)
+    records = []
+    for _, row in early.iterrows():
+        start = int(row["_position"])
+        matches = [position for position in confirmed_positions if start < position <= start + window]
+        end = min(matches) if matches else None
+        performance = (float(closes.iloc[end]) / float(closes.iloc[start]) - 1
+                       if end is not None and end < len(closes) and valid_number(closes.iloc[start]) else None)
+        records.append({"early_position": start, "confirmed_position": end,
+                        "delay": end - start if end is not None else None,
+                        "performance_to_confirmation": performance,
+                        "outcome": "Confirmé" if end is not None else "Setup non confirmé"})
+    confirmed_records = [record for record in records if record["confirmed_position"] is not None]
+    return {"records": records, "early_count": len(records), "confirmed_count": len(confirmed_records),
+            "confirmation_rate": len(confirmed_records) / len(records) if records else None,
+            "average_delay": pd.Series([record["delay"] for record in confirmed_records]).mean() if confirmed_records else None,
+            "average_performance_to_confirmation": pd.Series([record["performance_to_confirmation"] for record in confirmed_records]).mean() if confirmed_records else None,
+            "unconfirmed": early.iloc[[i for i, record in enumerate(records) if record["confirmed_position"] is None]].copy() if records else early.iloc[0:0].copy()}
+
+
 def extract_threshold_signals(series: pd.DataFrame, threshold: float,
                               min_gap: int = MIN_SIGNAL_GAP) -> pd.DataFrame:
     """Extrait les franchissements haussiers avec le même espacement que V1."""
@@ -1115,6 +1349,28 @@ def _lab_variant(timing: pd.DataFrame, threshold: float,
     signals = extract_threshold_signals(timing, threshold)
     signals = calculate_signal_drawdowns(calculate_forward_returns(signals, timeline), timeline)
     return signals, calculate_backtest_statistics(signals)
+
+
+def _v3_variant(series: pd.DataFrame, signal_type: str) -> tuple[pd.DataFrame, dict[str, Any]]:
+    signals = extract_v3_signals(series, signal_type)
+    signals = calculate_signal_drawdowns(calculate_forward_returns(signals, series), series)
+    return signals, calculate_backtest_statistics(signals)
+
+
+def _render_v3_snapshot(result: dict[str, Any]) -> None:
+    """Affichage vertical et mobile des trois étapes, avant l'indice secondaire."""
+    st.markdown("### V3 — Régime / Setup / Trigger")
+    icons = {"Favorable": "✅", "Mitigé": "🟡", "Défavorable": "❌", "Présent": "✅",
+             "Possible": "🟡", "Absent": "❌", "Fort": "✅", "Partiel": "🟠", "N/D": "⚪"}
+    for title, key in (("Régime", "regime"), ("Setup", "setup"), ("Trigger", "trigger")):
+        stage = result[key]
+        st.markdown(f"**{title} : {icons.get(stage['status'], '⚪')} {stage['status']}**")
+        for condition in stage["conditions"]:
+            marker = "⚪" if not condition["available"] else "✅" if condition["passed"] else "❌"
+            st.caption(f"{marker} {condition['label']} — {condition['detail']}")
+    st.info(result["status"])
+    st.caption("V3 sépare le contexte, le setup et le déclenchement afin d'éviter de confondre tendance saine et moment d'entrée.")
+    st.caption(f"Indice expérimental V3 (métrique technique de backtest) : {result['metrics']['v3_signal_strength']:.0f}/100")
 
 
 def _lab_eligible(history: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -1339,13 +1595,14 @@ def _render_out_of_sample_results(result: dict[str, Any]) -> None:
 
 
 def render_timing_lab() -> None:
-    """Interface expérimentale comparant V1 inchangée à V2."""
+    """Interface expérimentale comparant V1 et V2 inchangées à V3."""
     st.title("🧬 Timing Lab")
     st.caption("Comparez le moteur Timing actuel à une logique expérimentale de repli + reprise.")
     st.warning("Le Lab est un outil expérimental. Il sert à évaluer des règles, pas à sélectionner automatiquement la meilleure stratégie.")
-    left, right = st.columns(2)
+    left, middle, right = st.columns(3)
     left.markdown("### V1 Timing actuel\nConvergence et confirmation de tendance — moteur historique inchangé.")
-    right.markdown("### V2 Repli + Reprise\nConvergence d'un contexte long terme, d'un repli raisonnable et d'un début de reprise — **ce score n'est pas une probabilité**.")
+    middle.markdown("### V2 Repli + Reprise\nMoteur expérimental historique inchangé — **ce score n'est pas une probabilité**.")
+    right.markdown("### V3 Régime / Setup / Trigger\nDécision en trois étapes ; l'indice n'est qu'une métrique secondaire de backtest.")
     st.subheader("Qui fait historiquement mieux ?")
     periods = {"1 an": "1y", "2 ans": "2y", "3 ans": "3y", "5 ans": "5y"}
     c1, c2, c3, c4 = st.columns(4)
@@ -1353,7 +1610,7 @@ def render_timing_lab() -> None:
     period_label = c2.selectbox("Période", list(periods), index=2, key="lab_period")
     threshold1 = c3.slider("Seuil V1", 40, 90, 70, key="lab_v1")
     threshold2 = c4.slider("Seuil V2", 40, 90, 70, key="lab_v2")
-    if st.button("🧪 Comparer V1 et V2", type="primary") and ticker:
+    if st.button("🧪 Comparer V1, V2 et V3", type="primary") and ticker:
         with st.spinner("Comparaison causale en cours…"):
             histories = load_timing_lab_histories((ticker,), periods[period_label])
             history = histories.get(ticker, pd.DataFrame())
@@ -1364,7 +1621,26 @@ def render_timing_lab() -> None:
                 s1, stats1 = _lab_variant(v1, threshold1, v1)
                 s2, stats2 = _lab_variant(v2, threshold2, v2)
                 baseline = calculate_backtest_statistics(calculate_forward_returns(v1, v1))
-                st.dataframe(_lab_table(stats1, stats2, baseline), use_container_width=True, hide_index=True)
+                v3 = calculate_v3_timing_series(history).loc[v1.index].copy()
+                v3["_position"] = range(len(v3))
+                early, stats_early = _v3_variant(v3, "early")
+                confirmed, stats_confirmed = _v3_variant(v3, "confirmed")
+                comparison = []
+                for label, stats in (("V1", stats1), ("V2", stats2),
+                                     ("V3 Early", stats_early), ("V3 Confirmed", stats_confirmed)):
+                    comparison.append({"Moteur": label, "20j": format_percentage(stats[20]["mean"]),
+                                       "Alpha 20j": format_alpha(calculate_alpha(stats[20]["mean"], baseline[20]["mean"])),
+                                       "% positif": f"{stats[20]['positive']:.0%}" if valid_number(stats[20]["positive"]) else "N/D",
+                                       "Drawdown": format_percentage(stats[20]["drawdown_mean"])})
+                st.dataframe(pd.DataFrame(comparison), use_container_width=True, hide_index=True)
+                _render_v3_snapshot(calculate_rigorous_entry_v3(history))
+                confirmation = analyze_v3_confirmations(early, confirmed, v3)
+                m1, m2, m3 = st.columns(3)
+                m1.metric("V3 Early", confirmation["early_count"]); m2.metric("Confirmés sous 15 séances", confirmation["confirmed_count"])
+                m3.metric("Taux de confirmation observé", f"{confirmation['confirmation_rate']:.1%}" if valid_number(confirmation["confirmation_rate"]) else "N/D")
+                st.caption(f"Délai Early → Confirmed : {confirmation['average_delay']:.1f} séances · performance déjà passée : {format_percentage(confirmation['average_performance_to_confirmation'])}." if valid_number(confirmation["average_delay"]) else "Aucune paire Early → Confirmed observée sous 15 séances.")
+                unconfirmed = calculate_backtest_statistics(calculate_signal_drawdowns(calculate_forward_returns(confirmation["unconfirmed"], v3), v3))
+                st.caption("Setups non confirmés — " + " · ".join(f"{h}j {format_percentage(unconfirmed[h]['mean'])}" for h in BACKTEST_HORIZONS))
                 m1, m2, m3 = st.columns(3)
                 m1.metric("Signaux V1", len(s1)); m2.metric("Signaux V2", len(s2))
                 common = s1.index.intersection(s2.index)
