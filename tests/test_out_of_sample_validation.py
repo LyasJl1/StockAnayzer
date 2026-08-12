@@ -9,7 +9,9 @@ import pandas as pd
 
 NAMES = {"valid_number", "calculate_alpha", "format_alpha", "split_validation_universes",
          "aggregate_out_of_sample", "out_of_sample_robustness",
-         "build_out_of_sample_interpretation", "build_horizon_stability"}
+         "build_out_of_sample_interpretation", "build_horizon_stability",
+         "build_v3_oos_interpretation", "aggregate_v3_confirmations",
+         "aggregate_unconfirmed_v3_alpha"}
 tree = ast.parse(Path("app.py").read_text(encoding="utf-8"))
 nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in NAMES]
 namespace = {"pd": pd, "Any": Any, "isfinite": isfinite, "BACKTEST_HORIZONS": (5, 20, 60)}
@@ -82,3 +84,38 @@ def test_weak_and_strong_deterministic_conclusions():
     text = build_out_of_sample_interpretation("V1", strong, "Encourageante")
     assert "V1 montre un avantage historique encourageant hors échantillon sur cet univers" in text
     assert "validation sur d'autres périodes reste nécessaire" in text
+
+
+def test_v3_interpretation_covers_early_confirmed_and_weak_cases():
+    early = {"alpha_mean": .02, "alpha_median": .01, "positive_ratio": .75}
+    confirmed = {"alpha_mean": .005, "alpha_median": .002, "positive_ratio": .55}
+    assert "Setup V3 semble apporter davantage" in build_v3_oos_interpretation(early, confirmed)
+    assert "confirmation V3 semble" in build_v3_oos_interpretation(
+        {"alpha_mean": .002, "alpha_median": .001, "positive_ratio": .45},
+        {"alpha_mean": .015, "alpha_median": .01, "positive_ratio": .7})
+    assert "ne montre pas d'avantage robuste" in build_v3_oos_interpretation(
+        {"alpha_mean": -.01, "alpha_median": -.02, "positive_ratio": .25},
+        {"alpha_mean": -.02, "alpha_median": -.01, "positive_ratio": .2})
+
+
+def test_confirmation_aggregation_uses_observed_pairs_only():
+    records = [{"confirmed_position": 8, "delay": 3, "performance_to_confirmation": .02},
+               {"confirmed_position": None, "delay": None, "performance_to_confirmation": None},
+               {"confirmed_position": 20, "delay": 7, "performance_to_confirmation": -.01}]
+    raw = [{"v3_confirmation": {"records": records, "early_count": 3, "confirmed_count": 2}}]
+    result = aggregate_v3_confirmations(raw)
+    assert result["early"] == 3 and result["confirmed"] == 2 and result["unconfirmed"] == 1
+    assert result["rate"] == 2 / 3 and result["delay_mean"] == 5
+    assert result["delay_median"] == 5 and abs(result["cost_mean"] - .005) < 1e-12
+
+
+def test_unconfirmed_alpha_is_aggregated_per_ticker_without_imputation():
+    raw = [
+        {"v3_unconfirmed": {20: {"mean": .04}}, "baseline": {20: {"mean": .02}}},
+        {"v3_unconfirmed": {20: {"mean": 0}}, "baseline": {20: {"mean": .01}}},
+        {"v3_unconfirmed": {20: {"mean": None}}, "baseline": {20: {"mean": .03}}},
+    ]
+    result = aggregate_unconfirmed_v3_alpha(raw)
+    assert result["assets"] == 2
+    assert abs(result["alpha_mean"] * 100 - .5) < 1e-12
+    assert abs(result["alpha_median"] * 100 - .5) < 1e-12

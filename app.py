@@ -1150,7 +1150,9 @@ def analyze_v3_confirmations(early: pd.DataFrame, confirmed: pd.DataFrame,
     return {"records": records, "early_count": len(records), "confirmed_count": len(confirmed_records),
             "confirmation_rate": len(confirmed_records) / len(records) if records else None,
             "average_delay": pd.Series([record["delay"] for record in confirmed_records]).mean() if confirmed_records else None,
+            "median_delay": pd.Series([record["delay"] for record in confirmed_records]).median() if confirmed_records else None,
             "average_performance_to_confirmation": pd.Series([record["performance_to_confirmation"] for record in confirmed_records]).mean() if confirmed_records else None,
+            "median_performance_to_confirmation": pd.Series([record["performance_to_confirmation"] for record in confirmed_records]).median() if confirmed_records else None,
             "unconfirmed": early.iloc[[i for i, record in enumerate(records) if record["confirmed_position"] is None]].copy() if records else early.iloc[0:0].copy()}
 
 
@@ -1220,9 +1222,11 @@ def aggregate_out_of_sample(raw_stats: list[dict[str, Any]]) -> list[dict[str, A
     """Agrège sans imputation : une action pèse une fois, sauf l'alpha pondéré."""
     rows: list[dict[str, Any]] = []
     for horizon in BACKTEST_HORIZONS:
-        for engine in ("V1", "V2"):
+        for engine in ("V1", "V2", "V3 Early", "V3 Confirmed"):
             available, baselines = [], []
             for item in raw_stats:
+                if engine not in item:
+                    continue
                 stats, baseline = item[engine][horizon], item["baseline"][horizon]
                 alpha = calculate_alpha(stats["mean"], baseline["mean"])
                 if valid_number(alpha):
@@ -1430,7 +1434,7 @@ def _lab_table(stats1: dict[str, Any], stats2: dict[str, Any],
 
 def _calculate_validation_assets(tickers: tuple[str, ...], histories: dict[str, pd.DataFrame],
                                  threshold1: float, threshold2: float) -> tuple[list[dict[str, Any]], list[str]]:
-    """Applique strictement les moteurs et la baseline existants à chaque actif valide."""
+    """Mesure les quatre signaux sur une fenêtre, une baseline et un warm-up identiques."""
     results, ignored = [], []
     for symbol in tickers:
         history = histories.get(symbol, pd.DataFrame())
@@ -1443,10 +1447,24 @@ def _calculate_validation_assets(tickers: tuple[str, ...], histories: dict[str, 
             continue
         s1, stats1 = _lab_variant(v1, threshold1, v1)
         s2, stats2 = _lab_variant(v2, threshold2, v2)
+        # La série V3 est la détection existante, calculée sur tout le warm-up puis
+        # seulement découpée sur les dates admissibles communes à V1/V2.
+        v3 = calculate_v3_timing_series(history).reindex(v1.index).dropna(subset=["close"]).copy()
+        v3["_position"] = range(len(v3))
+        early, stats_early = _v3_variant(v3, "early")
+        confirmed, stats_confirmed = _v3_variant(v3, "confirmed")
+        confirmation = analyze_v3_confirmations(early, confirmed, v3)
+        unconfirmed_rows = calculate_signal_drawdowns(
+            calculate_forward_returns(confirmation["unconfirmed"], v3), v3)
+        unconfirmed_stats = calculate_backtest_statistics(unconfirmed_rows)
         baseline_rows = calculate_signal_drawdowns(calculate_forward_returns(v1, v1), v1)
         baseline = calculate_backtest_statistics(baseline_rows)
         results.append({"ticker": symbol, "V1": stats1, "V2": stats2,
-                        "baseline": baseline, "signals_V1": len(s1), "signals_V2": len(s2)})
+                        "V3 Early": stats_early, "V3 Confirmed": stats_confirmed,
+                        "baseline": baseline, "signals_V1": len(s1), "signals_V2": len(s2),
+                        "signals_V3 Early": len(early), "signals_V3 Confirmed": len(confirmed),
+                        "v3_confirmation": confirmation,
+                        "v3_unconfirmed": unconfirmed_stats})
     return results, ignored
 
 
@@ -1454,11 +1472,13 @@ def _validation_export(raw_stats: list[dict[str, Any]]) -> pd.DataFrame:
     rows = []
     for item in raw_stats:
         row = {"Ticker": item["ticker"], "V1 signals": item["signals_V1"],
-               "V2 signals": item["signals_V2"]}
+               "V2 signals": item["signals_V2"],
+               "V3 Early signals": item["signals_V3 Early"],
+               "V3 Confirmed signals": item["signals_V3 Confirmed"]}
         for horizon in BACKTEST_HORIZONS:
             baseline = item["baseline"][horizon]["mean"]
             row[f"baseline {horizon}"] = baseline
-            for engine in ("V1", "V2"):
+            for engine in ("V1", "V2", "V3 Early", "V3 Confirmed"):
                 stats = item[engine][horizon]
                 row[f"{engine} perf {horizon}"] = stats["mean"]
                 row[f"{engine} alpha {horizon}"] = calculate_alpha(stats["mean"], baseline)
@@ -1467,6 +1487,52 @@ def _validation_export(raw_stats: list[dict[str, Any]]) -> pd.DataFrame:
                 row[f"{engine} drawdown worst {horizon}"] = stats["drawdown_worst"]
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def build_v3_oos_interpretation(early: dict[str, Any], confirmed: dict[str, Any]) -> str:
+    """Répond à la question Early/Confirmed avec quatre cas déterministes."""
+    em, ed, er = early.get("alpha_mean"), early.get("alpha_median"), early.get("positive_ratio")
+    cm, cd, cr = confirmed.get("alpha_mean"), confirmed.get("alpha_median"), confirmed.get("positive_ratio")
+    if all(valid_number(x) for x in (em, ed, er, cm)) and em > 0 and ed > 0 and er > .5 and em > cm:
+        return ("🟢 Le Setup V3 semble apporter davantage d'information que le Trigger actuel. "
+                "Le Trigger pourrait être trop tardif ou trop restrictif.")
+    if all(valid_number(x) for x in (em, ed, cm, cd)) and em <= 0 and ed <= 0 and cm <= 0 and cd <= 0:
+        return ("🔴 V3 ne montre pas d'avantage robuste hors échantillon. Ni le Setup précoce ni "
+                "la confirmation actuelle ne produisent un edge historique clair.")
+    if all(valid_number(x) for x in (cm, em, cr)) and cm > em and cm > 0 and cr > .5:
+        return "🟢 La confirmation V3 semble historiquement améliorer les setups Early sur cet échantillon."
+    return "🟠 Les résultats V3 sont mitigés et dépendent de l'horizon ou des actions étudiées."
+
+
+def aggregate_v3_confirmations(raw_stats: list[dict[str, Any]]) -> dict[str, Any]:
+    """Agrège les appariements Early→Confirmed et les setups non confirmés, sans imputation."""
+    records = [record for item in raw_stats for record in item["v3_confirmation"]["records"]]
+    paired = [record for record in records if record["confirmed_position"] is not None]
+    unconfirmed = sum(item["v3_confirmation"]["early_count"] - item["v3_confirmation"]["confirmed_count"]
+                      for item in raw_stats)
+    delays = pd.Series([record["delay"] for record in paired], dtype=float)
+    costs = pd.Series([record["performance_to_confirmation"] for record in paired], dtype=float)
+    return {"early": len(records), "confirmed": len(paired), "unconfirmed": unconfirmed,
+            "rate": len(paired) / len(records) if records else None,
+            "delay_mean": delays.mean() if len(delays) else None,
+            "delay_median": delays.median() if len(delays) else None,
+            "cost_mean": costs.mean() if len(costs) else None,
+            "cost_median": costs.median() if len(costs) else None}
+
+
+def aggregate_unconfirmed_v3_alpha(raw_stats: list[dict[str, Any]]) -> dict[str, Any]:
+    """Agrège à poids égal les alphas 20j non confirmés disponibles par action."""
+    alphas = []
+    for item in raw_stats:
+        unconfirmed = item["v3_unconfirmed"][20]["mean"]
+        baseline = item["baseline"][20]["mean"]
+        alpha = calculate_alpha(unconfirmed, baseline)
+        if valid_number(alpha):
+            alphas.append(float(alpha))
+    values = pd.Series(alphas, dtype=float)
+    return {"alpha_mean": values.mean() if len(values) else None,
+            "alpha_median": values.median() if len(values) else None,
+            "assets": len(values)}
 
 
 def _render_out_of_sample_results(result: dict[str, Any]) -> None:
@@ -1482,94 +1548,175 @@ def _render_out_of_sample_results(result: dict[str, Any]) -> None:
         st.warning("⚠️ Univers de validation trop petit pour tirer une conclusion robuste.")
     elif valid_assets < 10:
         st.warning("🟠 Univers de validation limité.")
+
+    engines = ("V1", "V2", "V3 Early", "V3 Confirmed")
     summaries = aggregate_out_of_sample(raw_stats)
     by_engine = {engine: {row["horizon"]: row for row in summaries if row["engine"] == engine}
-                 for engine in ("V1", "V2")}
-
-    st.markdown("### 📊 Validation hors échantillon — 20 séances")
-    cols = st.columns(2)
+                 for engine in engines}
     baseline_dd = pd.Series([item["baseline"][20]["drawdown_mean"] for item in raw_stats
                              if valid_number(item["baseline"][20]["drawdown_mean"])]).mean()
-    robustness = {}
-    for column, engine in zip(cols, ("V1", "V2")):
+    robustness = {engine: out_of_sample_robustness(by_engine[engine][20], by_engine[engine][60], baseline_dd)
+                  for engine in engines}
+
+    st.markdown("### 📊 Synthèse principale — quatre moteurs")
+    engine_rows = []
+    for engine in engines:
+        row = {"Moteur": engine}
+        for horizon in BACKTEST_HORIZONS:
+            row[f"Alpha {horizon}j"] = format_alpha(by_engine[engine][horizon]["alpha_mean"])
+        summary20 = by_engine[engine][20]
+        row["Alpha médian 20j"] = format_alpha(summary20["alpha_median"])
+        row["Actions alpha + 20j"] = f"{summary20['positive_assets']} / {summary20['assets']}"
+        engine_rows.append(row)
+    st.dataframe(pd.DataFrame(engine_rows), use_container_width=True, hide_index=True)
+
+    st.markdown("### 📊 Validation hors échantillon — 20 séances")
+    for engine in engines:
         summary = by_engine[engine][20]
-        robustness[engine] = out_of_sample_robustness(summary, by_engine[engine][60], baseline_dd)
-        column.markdown(f"#### {engine}")
-        column.write(f"Performance moyenne : **{format_percentage(summary['performance_mean'])}**  \n"
+        title = f"{engine} — Validation hors échantillon" if engine.startswith("V3") else engine
+        with st.container(border=True):
+            st.markdown(f"#### {title}")
+            st.write(f"Performance moyenne : **{format_percentage(summary['performance_mean'])}** · "
                      f"Performance médiane : **{format_percentage(summary['performance_median'])}**  \n"
-                     f"Baseline : **{format_percentage(summary['baseline_mean'])}**  \n"
-                     f"Alpha moyen : **{format_alpha(summary['alpha_mean'])}**  \n"
+                     f"Baseline : **{format_percentage(summary['baseline_mean'])}** · "
+                     f"Alpha moyen : **{format_alpha(summary['alpha_mean'])}** · "
                      f"Alpha médian : **{format_alpha(summary['alpha_median'])}**  \n"
-                     f"Alpha pondéré par observations : **{format_alpha(summary['alpha_weighted'])}**  \n"
-                     f"Actions alpha positif : **{summary['positive_assets']} / {summary['assets']} "
-                     f"({summary['positive_ratio']:.0%})**  \n"
-                     f"Actions alpha ≤ 0 : **{summary['nonpositive_assets']} / {summary['assets']}**  \n"
-                     f"Signaux : **{summary['observations']}**  \n"
-                     f"Robustesse hors échantillon : **{robustness[engine]}**")
-        column.write(build_out_of_sample_interpretation(engine, summary, robustness[engine]))
-        if warning := sample_size_warning(summary["observations"]):
-            column.warning(warning)
+                     f"Alpha pondéré par observations : **{format_alpha(summary['alpha_weighted'])}** · "
+                     f"Actions avec alpha positif : **{summary['positive_assets']} / {summary['assets']}** · "
+                     f"Nombre total de signaux : **{summary['observations']}**  \n"
+                     f"Drawdown moyen : **{format_percentage(summary['drawdown_mean'])}** · "
+                     f"Pire drawdown : **{format_percentage(summary['drawdown_worst'])}** · "
+                     f"Robustesse : **{robustness[engine]}**")
+            st.write(build_out_of_sample_interpretation(engine, summary, robustness[engine]))
+            if warning := sample_size_warning(summary["observations"]):
+                st.warning(warning)
 
     table20 = []
     for item in raw_stats:
         base = item["baseline"][20]["mean"]
-        table20.append({"Ticker": item["ticker"], "V1 20j": format_percentage(item["V1"][20]["mean"]),
-                        "Alpha V1": format_alpha(calculate_alpha(item["V1"][20]["mean"], base)),
-                        "V2 20j": format_percentage(item["V2"][20]["mean"]),
-                        "Alpha V2": format_alpha(calculate_alpha(item["V2"][20]["mean"], base)),
-                        "Baseline 20j": format_percentage(base), "Signaux V1": item["signals_V1"],
-                        "Signaux V2": item["signals_V2"]})
+        table20.append({"Ticker": item["ticker"], "Baseline 20j": format_percentage(base),
+                        "V1 Alpha": format_alpha(calculate_alpha(item["V1"][20]["mean"], base)),
+                        "V2 Alpha": format_alpha(calculate_alpha(item["V2"][20]["mean"], base)),
+                        "V3 Early Alpha": format_alpha(calculate_alpha(item["V3 Early"][20]["mean"], base)),
+                        "V3 Confirmed Alpha": format_alpha(calculate_alpha(item["V3 Confirmed"][20]["mean"], base)),
+                        "Signaux Early": item["signals_V3 Early"],
+                        "Signaux Confirmed": item["signals_V3 Confirmed"]})
     st.dataframe(pd.DataFrame(table20), use_container_width=True, hide_index=True)
 
-    with st.expander("Résultats détaillés — 5 et 60 séances"):
-        detail = []
+    with st.expander("Statistiques par action — 5 / 20 / 60 séances"):
+        details = []
         for item in raw_stats:
-            row = {"Ticker": item["ticker"]}
-            for horizon in (5, 60):
-                base = item["baseline"][horizon]["mean"]
-                row[f"Baseline {horizon}j"] = format_percentage(base)
-                for engine in ("V1", "V2"):
-                    row[f"{engine} {horizon}j"] = format_percentage(item[engine][horizon]["mean"])
-                    row[f"Alpha {engine} {horizon}j"] = format_alpha(calculate_alpha(item[engine][horizon]["mean"], base))
-            detail.append(row)
-        st.dataframe(pd.DataFrame(detail), use_container_width=True, hide_index=True)
+            for engine in engines:
+                for horizon in BACKTEST_HORIZONS:
+                    stats, baseline = item[engine][horizon], item["baseline"][horizon]["mean"]
+                    details.append({"Ticker": item["ticker"], "Moteur": engine,
+                                    "Horizon": f"{horizon} séances", "Signaux": stats["observations"],
+                                    "Performance moyenne": format_percentage(stats["mean"]),
+                                    "Performance médiane": format_percentage(stats["median"]),
+                                    "% positifs": f"{stats['positive']:.1%}" if valid_number(stats["positive"]) else "N/D",
+                                    "Baseline": format_percentage(baseline),
+                                    "Alpha": format_alpha(calculate_alpha(stats["mean"], baseline)),
+                                    "Drawdown moyen": format_percentage(stats["drawdown_mean"]),
+                                    "Pire drawdown": format_percentage(stats["drawdown_worst"])})
+        st.dataframe(pd.DataFrame(details), use_container_width=True, hide_index=True)
+
+    st.markdown("### ⚡ Early ou Confirmed : que montre l'historique ?")
+    comparison = []
+    for horizon in BACKTEST_HORIZONS:
+        early, confirmed = by_engine["V3 Early"][horizon], by_engine["V3 Confirmed"][horizon]
+        comparable = [(calculate_alpha(item["V3 Early"][horizon]["mean"], item["baseline"][horizon]["mean"]),
+                       calculate_alpha(item["V3 Confirmed"][horizon]["mean"], item["baseline"][horizon]["mean"]))
+                      for item in raw_stats]
+        comparable = [(a, b) for a, b in comparable if valid_number(a) and valid_number(b)]
+        wins = sum(a > b for a, b in comparable)
+        comparison.append({"Horizon": f"{horizon} séances",
+                           "Early perf. moyenne": format_percentage(early["performance_mean"]),
+                           "Confirmed perf. moyenne": format_percentage(confirmed["performance_mean"]),
+                           "Early Alpha": format_alpha(early["alpha_mean"]),
+                           "Confirmed Alpha": format_alpha(confirmed["alpha_mean"]),
+                           "Early alpha médian": format_alpha(early["alpha_median"]),
+                           "Confirmed alpha médian": format_alpha(confirmed["alpha_median"]),
+                           "Early actions alpha +": f"{early['positive_assets']} / {early['assets']}",
+                           "Confirmed actions alpha +": f"{confirmed['positive_assets']} / {confirmed['assets']}",
+                           "Early drawdown moy.": format_percentage(early["drawdown_mean"]),
+                           "Confirmed drawdown moy.": format_percentage(confirmed["drawdown_mean"]),
+                           "Signaux Early / Confirmed": f"{early['observations']} / {confirmed['observations']}",
+                           "Early > Confirmed": f"{wins} / {len(comparable)} actions"})
+        st.write(f"Early bat Confirmed sur **{wins}/{len(comparable)} actions** à {horizon} séances.")
+    st.dataframe(pd.DataFrame(comparison), use_container_width=True, hide_index=True)
+    st.info(build_v3_oos_interpretation(by_engine["V3 Early"][20], by_engine["V3 Confirmed"][20]))
+
+    confirmations = aggregate_v3_confirmations(raw_stats)
+    st.markdown("### 🔁 Taux de confirmation observé historiquement")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Early total", confirmations["early"])
+    c2.metric("Confirmés sous 15 séances", confirmations["confirmed"])
+    c3.metric("Taux observé", f"{confirmations['rate']:.1%}" if valid_number(confirmations["rate"]) else "N/D")
+    st.write(f"Délai moyen Early → Confirmed : **{confirmations['delay_mean']:.1f} séances** · "
+             f"Délai médian : **{confirmations['delay_median']:.1f} séances**" if valid_number(confirmations["delay_mean"]) else
+             "Aucune paire Early → Confirmed observée sous 15 séances.")
+    st.write(f"Performance déjà passée avant confirmation — moyenne : **{format_percentage(confirmations['cost_mean'])}** · "
+             f"médiane : **{format_percentage(confirmations['cost_median'])}**")
+    confirmation_rows = []
+    for item in raw_stats:
+        data = item["v3_confirmation"]
+        confirmation_rows.append({"Ticker": item["ticker"], "Early": data["early_count"],
+                                  "Confirmés sous 15 séances": data["confirmed_count"],
+                                  "Taux observé": f"{data['confirmation_rate']:.1%}" if valid_number(data["confirmation_rate"]) else "N/D"})
+    st.dataframe(pd.DataFrame(confirmation_rows), use_container_width=True, hide_index=True)
+
+    st.markdown("### Setups Early non confirmés sous 15 séances")
+    unconfirmed_row = {"Nombre": confirmations["unconfirmed"]}
+    unconfirmed_alpha = aggregate_unconfirmed_v3_alpha(raw_stats)
+    for horizon in BACKTEST_HORIZONS:
+        pieces = [(item["v3_unconfirmed"][horizon]["mean"], item["v3_unconfirmed"][horizon]["observations"])
+                  for item in raw_stats if valid_number(item["v3_unconfirmed"][horizon]["mean"])]
+        observations = sum(n for _, n in pieces)
+        mean = sum(value * n for value, n in pieces) / observations if observations else None
+        positives = [(item["v3_unconfirmed"][horizon]["positive"], item["v3_unconfirmed"][horizon]["observations"])
+                     for item in raw_stats if valid_number(item["v3_unconfirmed"][horizon]["positive"])]
+        positive_n = sum(n for _, n in positives)
+        positive = sum(value * n for value, n in positives) / positive_n if positive_n else None
+        unconfirmed_row[f"Performance moyenne {horizon}j"] = format_percentage(mean)
+        unconfirmed_row[f"% positifs {horizon}j"] = f"{positive:.1%}" if valid_number(positive) else "N/D"
+        if horizon == 20:
+            unconfirmed_row["Alpha moyen 20j"] = format_alpha(unconfirmed_alpha["alpha_mean"])
+            unconfirmed_row["Alpha médian 20j"] = format_alpha(unconfirmed_alpha["alpha_median"])
+            unconfirmed_row["Actions disponibles"] = unconfirmed_alpha["assets"]
+    st.dataframe(pd.DataFrame([unconfirmed_row]), use_container_width=True, hide_index=True)
 
     st.markdown("#### Synthèse complète")
     synthesis = [{"Moteur": row["engine"], "Horizon": f"{row['horizon']} séances",
                   "Perf moyenne": format_percentage(row["performance_mean"]),
                   "Perf médiane": format_percentage(row["performance_median"]),
-                  "Baseline": format_percentage(row["baseline_mean"]),
-                  "Alpha moyen": format_alpha(row["alpha_mean"]),
+                  "Baseline": format_percentage(row["baseline_mean"]), "Alpha moyen": format_alpha(row["alpha_mean"]),
                   "Alpha médian": format_alpha(row["alpha_median"]),
                   "Alpha pondéré / observations": format_alpha(row["alpha_weighted"]),
-                  "Alpha positif": f"{row['positive_assets']} / {row['assets']} ({row['positive_ratio']:.0%})",
-                  "Alpha ≤ 0": f"{row['nonpositive_assets']} / {row['assets']}",
+                  "Alpha positif": f"{row['positive_assets']} / {row['assets']}",
                   "Drawdown moy.": format_percentage(row["drawdown_mean"]),
-                  "Drawdown médian": format_percentage(row["drawdown_median"]),
-                  "Pire drawdown": format_percentage(row["drawdown_worst"]),
-                  "Signaux": row["observations"]} for row in summaries]
+                  "Pire drawdown": format_percentage(row["drawdown_worst"]), "Signaux": row["observations"]}
+                 for row in summaries]
     st.dataframe(pd.DataFrame(synthesis), use_container_width=True, hide_index=True)
 
-    st.markdown("#### Stabilité par horizon et entre actions")
-    for engine in ("V1", "V2"):
+    st.markdown("#### Stabilité, meilleur et pire alpha par action")
+    for engine in engines:
         st.write(f"**{engine}** — {build_horizon_stability(engine, by_engine[engine])}")
         asset_alphas = [(item["ticker"], calculate_alpha(item[engine][20]["mean"], item["baseline"][20]["mean"]))
                         for item in raw_stats]
         asset_alphas = [(ticker, alpha) for ticker, alpha in asset_alphas if valid_number(alpha)]
         if asset_alphas:
             best, worst = max(asset_alphas, key=lambda x: x[1]), min(asset_alphas, key=lambda x: x[1])
-            st.caption(f"Meilleur alpha : {best[0]} {format_alpha(best[1])} — Pire alpha : "
-                       f"{worst[0]} {format_alpha(worst[1])} — écart {format_alpha(best[1] - worst[1])}.")
+            st.caption(f"Meilleur alpha : {best[0]} {format_alpha(best[1])} — Pire alpha : {worst[0]} {format_alpha(worst[1])}.")
 
     chart = go.Figure()
-    for engine in ("V1", "V2"):
+    for engine in engines:
         chart.add_trace(go.Bar(name=engine, x=[item["ticker"] for item in raw_stats],
                                y=[calculate_alpha(item[engine][20]["mean"], item["baseline"][20]["mean"]) * 100
                                   if valid_number(calculate_alpha(item[engine][20]["mean"], item["baseline"][20]["mean"])) else None
                                   for item in raw_stats]))
     chart.add_hline(y=0, line_color="#94a3b8")
-    chart.update_layout(title="Distribution de l'alpha 20 séances par action", barmode="group",
-                        yaxis_title="Alpha (points de pourcentage)", height=380,
+    chart.update_layout(title="Alpha 20 séances par action — V1, V2, V3 Early et V3 Confirmed", barmode="group",
+                        yaxis_title="Alpha (points de pourcentage)", height=420,
                         margin=dict(l=10, r=10, t=50, b=10))
     st.plotly_chart(chart, use_container_width=True)
 
@@ -1579,8 +1726,7 @@ def _render_out_of_sample_results(result: dict[str, Any]) -> None:
     for engine in ("V1", "V2"):
         design_alpha = conception_20.get((engine, 20), {}).get("alpha_mean")
         validation_alpha = by_engine[engine][20]["alpha_mean"]
-        st.write(f"**{engine} Alpha moyen 20j** — Conception : {format_alpha(design_alpha)} · "
-                 f"Hors échantillon : {format_alpha(validation_alpha)}")
+        st.write(f"**{engine} Alpha moyen 20j** — Conception : {format_alpha(design_alpha)} · Hors échantillon : {format_alpha(validation_alpha)}")
         if valid_number(design_alpha) and design_alpha > 0 and (not valid_number(validation_alpha) or validation_alpha < design_alpha * .5):
             st.warning("⚠️ L'avantage observé pendant la conception diminue fortement hors échantillon.")
         elif valid_number(design_alpha) and valid_number(validation_alpha) and abs(validation_alpha - design_alpha) <= max(.005, abs(design_alpha) * .5):
@@ -1591,8 +1737,7 @@ def _render_out_of_sample_results(result: dict[str, Any]) -> None:
     export = _validation_export(raw_stats)
     st.download_button("⬇️ Exporter la validation hors échantillon", export.to_csv(index=False).encode("utf-8"),
                        "timing_out_of_sample_validation.csv", "text/csv")
-    st.info("Prochaine étape méthodologique : validation temporelle / walk-forward sur une période jamais utilisée pour la conception.")
-
+    st.info("Validation descriptive uniquement : aucune règle, aucun seuil et aucun ticker n'ont été optimisés.")
 
 def render_timing_lab() -> None:
     """Interface expérimentale comparant V1 et V2 inchangées à V3."""
