@@ -2022,6 +2022,10 @@ def render_timing_lab() -> None:
                 lambda symbol, done, total: progress.progress(
                     50 + int(25 * done / max(total, 1)),
                     text=f"3/4 Calcul conception : {done} / {total} actions — {symbol} terminé"))
+            validation_stats, ignored = _calculate_validation_assets(effective, histories, oos_v1, oos_v2)
+            progress.progress(50, text="3/4 Calcul de l'univers de conception")
+            conception_stats, conception_ignored = _calculate_validation_assets(
+                tuple(conception), histories, oos_v1, oos_v2)
             st.session_state["timing_oos_result"] = {
                 "signature": signature, "validation": validation_stats, "conception": conception_stats,
                 "ignored": ignored,
