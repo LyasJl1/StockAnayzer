@@ -67,7 +67,8 @@ def apply_styles() -> None:
           border-bottom:1px solid #25334a; padding:9px 0; }
         .trade-row:last-child { border:0; } .value { font-weight:750; text-align:right; }
         .disclaimer { font-size:.8rem; line-height:1.45; }
-        @media(max-width:768px) { .bar-row { grid-template-columns:95px 1fr 52px; } }
+        @media(max-width:768px) { .bar-row { grid-template-columns:minmax(90px,auto) 1fr minmax(62px,auto); }
+          .bar-row > :last-child { white-space:nowrap; } }
         </style>
         """,
         unsafe_allow_html=True,
@@ -835,6 +836,122 @@ def calculate_baseline_statistics(timing: pd.DataFrame) -> dict[str, Any]:
     return calculate_backtest_statistics(calculate_forward_returns(baseline, baseline))
 
 
+def calculate_pullback_timing_series(data: pd.DataFrame) -> pd.DataFrame:
+    """Calcule V2 de façon vectorielle et causale (repli + début de reprise).
+
+    Chaque critère indisponible est retiré du dénominateur. Un rebond dont le
+    cours *et* la MM50 restent sous la MM200 est plafonné à 55/100.
+    """
+    if data.empty or "Close" not in data:
+        return pd.DataFrame()
+    frame = calculate_indicators(data)
+    frame["ATR14"] = calculate_atr(frame)
+    close, mm50, mm200 = frame["Close"], frame["MM50"], frame["MM200"]
+    rsi, macd, signal, atr = frame["RSI"], frame["MACD"], frame["Signal"], frame["ATR14"]
+    distance = close.div(mm50).sub(1).where(mm50.ne(0))
+    gap = macd - signal
+    components: dict[str, tuple[pd.Series, pd.Series, float]] = {}
+
+    def add(name: str, points: pd.Series, available: pd.Series, maximum: float) -> None:
+        components[name] = (points.where(available), available, maximum)
+
+    add("price_above_mm200", (close > mm200).astype(float) * 10, close.notna() & mm200.notna(), 10)
+    add("mm50_above_mm200", (mm50 > mm200).astype(float) * 10, mm50.notna() & mm200.notna(), 10)
+    add("mm200_rising", (mm200 > mm200.shift(20)).astype(float) * 10,
+        mm200.notna() & mm200.shift(20).notna(), 10)
+    pullback_points = pd.Series(0.0, index=frame.index)
+    pullback_points.mask(distance.between(-.05, -.01, inclusive="both"), 15, inplace=True)
+    pullback_points.mask(distance.between(-.01, .02, inclusive="neither"), 12, inplace=True)
+    pullback_points.mask(distance.between(-.08, -.05, inclusive="left"), 8, inplace=True)
+    pullback_points.mask(distance.between(.02, .06, inclusive="both"), 7, inplace=True)
+    pullback_points.mask(distance.between(-.12, -.08, inclusive="left"), 3, inplace=True)
+    pullback_points.mask(distance > .06, 2, inplace=True)
+    add("distance_mm50", pullback_points, distance.notna(), 15)
+    rsi_points = pd.Series(1.0, index=frame.index)
+    rsi_points.mask(rsi < 32, 3, inplace=True)
+    rsi_points.mask(rsi.between(32, 38, inclusive="left"), 6, inplace=True)
+    rsi_points.mask(rsi.between(38, 48, inclusive="both"), 10, inplace=True)
+    rsi_points.mask(rsi.between(48, 55, inclusive="right"), 7, inplace=True)
+    rsi_points.mask(rsi.between(55, 65, inclusive="right"), 4, inplace=True)
+    add("pullback_rsi", rsi_points, rsi.notna(), 10)
+    atr_distance = close.sub(mm50).abs().div(atr).where(atr.gt(0))
+    atr_distance_points = pd.Series(0.0, index=frame.index)
+    atr_distance_points.mask(atr_distance <= 2.5, 2, inplace=True)
+    atr_distance_points.mask(atr_distance <= 1.5, 4, inplace=True)
+    atr_distance_points.mask(atr_distance <= .75, 5, inplace=True)
+    add("support_atr", atr_distance_points, atr_distance.notna(), 5)
+    add("macd_gap_improving", (gap > gap.shift(5)).astype(float) * 10,
+        gap.notna() & gap.shift(5).notna(), 10)
+    add("rsi_improving", ((rsi > rsi.shift(3)) & (rsi >= 40)).astype(float) * 8,
+        rsi.notna() & rsi.shift(3).notna(), 8)
+    add("price_recovery", (close > close.shift(3)).astype(float) * 7,
+        close.notna() & close.shift(3).notna(), 7)
+    add("macd_cross", (macd > signal).astype(float) * 5, macd.notna() & signal.notna(), 5)
+    atr_percent = atr.div(close).where(close.gt(0))
+    atr_risk = pd.Series(0.0, index=frame.index)
+    atr_risk.mask(atr_percent <= .06, 1, inplace=True)
+    atr_risk.mask(atr_percent <= .045, 3, inplace=True)
+    atr_risk.mask(atr_percent <= .03, 4, inplace=True)
+    atr_risk.mask(atr_percent < .02, 5, inplace=True)
+    add("atr_risk", atr_risk, atr_percent.notna(), 5)
+    extension = pd.Series(0.0, index=frame.index)
+    extension.mask(distance.between(-.12, -.05, inclusive="left"), 2, inplace=True)
+    extension.mask(distance.between(-.05, .05, inclusive="both"), 5, inplace=True)
+    extension.mask(distance.between(.05, .10, inclusive="right"), 2, inplace=True)
+    add("extension_mm50", extension, distance.notna(), 5)
+
+    earned = sum((item[0].fillna(0) for item in components.values()), pd.Series(0.0, index=frame.index))
+    available = sum((item[1].astype(float) * item[2] for item in components.values()),
+                    pd.Series(0.0, index=frame.index))
+    score = earned.div(available.where(available.gt(0))).mul(100)
+    context_valid = ~((close < mm200) & (mm50 < mm200) & close.notna() & mm50.notna() & mm200.notna())
+    score = score.where(context_valid, score.clip(upper=55))
+    result = pd.DataFrame({
+        "date": frame.index, "close": close, "timing_score": score,
+        "timing_confidence": available, "MM50": mm50, "MM200": mm200,
+        "RSI": rsi, "MACD": macd, "Signal MACD": signal, "ATR14": atr,
+        "distance_mm50": distance, "distance_mm200": close.div(mm200).sub(1),
+        "distance_from_20d_high": close.div(close.rolling(20).max()).sub(1),
+        "long_term_context_valid": context_valid, "_position": range(len(frame)),
+    }, index=frame.index)
+    for name, (points, _, maximum) in components.items():
+        result[f"points_{name}"] = points
+        result[f"max_{name}"] = maximum
+    return result
+
+
+def extract_threshold_signals(series: pd.DataFrame, threshold: float,
+                              min_gap: int = MIN_SIGNAL_GAP) -> pd.DataFrame:
+    """Extrait les franchissements haussiers avec le même espacement que V1."""
+    if series.empty or "timing_score" not in series:
+        return series.iloc[0:0].copy()
+    candidates = series.loc[(series["timing_score"] >= threshold) &
+                            (series["timing_score"].shift(1) < threshold)].copy()
+    kept, last = [], None
+    for position in candidates["_position"].astype(int):
+        if last is None or position - last >= min_gap:
+            kept.append(position); last = position
+    return candidates[candidates["_position"].isin(kept)].copy()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_timing_lab_histories(tickers: tuple[str, ...], period: str) -> dict[str, pd.DataFrame]:
+    """Télécharge en une requête les historiques ajustés du Lab et leur warm-up."""
+    years = {"1y": 1, "2y": 2, "3y": 3, "5y": 5}.get(period, 3)
+    analysis_start = pd.Timestamp.now(tz="UTC").tz_localize(None).normalize() - pd.DateOffset(years=years)
+    start = analysis_start - timedelta(days=300)
+    raw = yf.download(list(tickers), start=start.date(), interval="1d", auto_adjust=True,
+                      progress=False, threads=True, group_by="ticker")
+    histories: dict[str, pd.DataFrame] = {}
+    for ticker in tickers:
+        frame = raw[ticker].copy() if isinstance(raw.columns, pd.MultiIndex) and ticker in raw.columns.levels[0] else raw.copy()
+        if "Close" in frame:
+            frame = frame.dropna(subset=["Close"])
+            frame.attrs["analysis_start"] = analysis_start
+            histories[ticker] = frame
+    return histories
+
+
 def sample_size_warning(n: int) -> str | None:
     if n < 10:
         return "⚠️ Échantillon très faible : résultat peu fiable."
@@ -884,6 +1001,185 @@ def render_backtest_charts(timing: pd.DataFrame, signals: pd.DataFrame, threshol
                                 xaxis_title="Performance (%)", height=320,
                                 margin=dict(l=10, r=10, t=50, b=10))
         st.plotly_chart(histogram, use_container_width=True)
+
+
+def _lab_variant(timing: pd.DataFrame, threshold: float,
+                 timeline: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+    signals = extract_threshold_signals(timing, threshold)
+    signals = calculate_signal_drawdowns(calculate_forward_returns(signals, timeline), timeline)
+    return signals, calculate_backtest_statistics(signals)
+
+
+def _lab_eligible(history: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Aligne strictement V1 et V2 sur la même fenêtre et les mêmes séances."""
+    v1 = calculate_historical_timing_series(history, "Investisseur")
+    v2 = calculate_pullback_timing_series(history)
+    start = history.attrs.get("analysis_start", v1.index.min())
+    dates = v1.index.intersection(v2.index)
+    mask = (dates >= start) & v1.loc[dates, "MM200"].notna() & v2.loc[dates, "MM200"].notna()
+    dates = dates[mask]
+    aligned_v1, aligned_v2 = v1.loc[dates].copy(), v2.loc[dates].copy()
+    positions = range(len(dates))
+    aligned_v1["_position"] = positions
+    aligned_v2["_position"] = range(len(dates))
+    return aligned_v1, aligned_v2
+
+
+def _render_lab_chart(v1: pd.DataFrame, v2: pd.DataFrame, s1: pd.DataFrame,
+                      s2: pd.DataFrame, threshold1: float, threshold2: float) -> None:
+    price = go.Figure(go.Scatter(x=v1.index, y=v1["close"], name="Cours", mode="lines"))
+    common = s1.index.intersection(s2.index)
+    only1, only2 = s1.index.difference(common), s2.index.difference(common)
+    for dates, label, symbol, color, size in ((only1, "V1 uniquement", "triangle-up", "#60a5fa", 9),
+                                               (only2, "V2 uniquement", "diamond", "#fb923c", 9),
+                                               (common, "V1 + V2", "star", "#34d399", 14)):
+        if len(dates):
+            price.add_trace(go.Scatter(x=dates, y=v1.loc[dates, "close"], name=label,
+                                       mode="markers", marker={"symbol": symbol, "color": color, "size": size}))
+    price.update_layout(title="Cours ajusté — signaux distincts et communs", height=360,
+                        margin=dict(l=10, r=10, t=50, b=10))
+    st.plotly_chart(price, use_container_width=True)
+    scores = go.Figure()
+    scores.add_trace(go.Scatter(x=v1.index, y=v1["timing_score"], name="V1 Timing actuel"))
+    scores.add_trace(go.Scatter(x=v2.index, y=v2["timing_score"], name="V2 Repli + Reprise"))
+    scores.add_hline(y=threshold1, line_dash="dash", line_color="#60a5fa", annotation_text="Seuil V1")
+    if threshold2 != threshold1:
+        scores.add_hline(y=threshold2, line_dash="dot", line_color="#fb923c", annotation_text="Seuil V2")
+    scores.update_yaxes(range=[0, 100], title="Convergence /100")
+    scores.update_layout(height=300, margin=dict(l=10, r=10, t=20, b=10))
+    st.plotly_chart(scores, use_container_width=True)
+
+
+def _lab_table(stats1: dict[str, Any], stats2: dict[str, Any],
+               baseline: dict[str, Any]) -> pd.DataFrame:
+    rows = []
+    for horizon in BACKTEST_HORIZONS:
+        a, b, base = stats1[horizon], stats2[horizon], baseline[horizon]
+        rows.append({"Horizon": f"{horizon} séances", "V1 perf moy.": format_percentage(a["mean"]),
+                     "V2 perf moy.": format_percentage(b["mean"]), "Baseline": format_percentage(base["mean"]),
+                     "V1 médiane": format_percentage(a["median"]), "V2 médiane": format_percentage(b["median"]),
+                     "V1 positifs": f"{a['positive']:.0%}" if valid_number(a["positive"]) else "N/D",
+                     "V2 positifs": f"{b['positive']:.0%}" if valid_number(b["positive"]) else "N/D",
+                     "V1 drawdown": format_percentage(a["drawdown_mean"]),
+                     "V2 drawdown": format_percentage(b["drawdown_mean"])})
+    return pd.DataFrame(rows)
+
+
+def render_timing_lab() -> None:
+    """Interface expérimentale comparant V1 inchangée à V2."""
+    st.title("🧬 Timing Lab")
+    st.caption("Comparez le moteur Timing actuel à une logique expérimentale de repli + reprise.")
+    st.warning("Le Lab est un outil expérimental. Il sert à évaluer des règles, pas à sélectionner automatiquement la meilleure stratégie.")
+    left, right = st.columns(2)
+    left.markdown("### V1 Timing actuel\nConvergence et confirmation de tendance — moteur historique inchangé.")
+    right.markdown("### V2 Repli + Reprise\nConvergence d'un contexte long terme, d'un repli raisonnable et d'un début de reprise — **ce score n'est pas une probabilité**.")
+    st.subheader("Qui fait historiquement mieux ?")
+    periods = {"1 an": "1y", "2 ans": "2y", "3 ans": "3y", "5 ans": "5y"}
+    c1, c2, c3, c4 = st.columns(4)
+    ticker = c1.text_input("Ticker", "AAPL", key="lab_ticker").strip().upper()
+    period_label = c2.selectbox("Période", list(periods), index=2, key="lab_period")
+    threshold1 = c3.slider("Seuil V1", 40, 90, 70, key="lab_v1")
+    threshold2 = c4.slider("Seuil V2", 40, 90, 70, key="lab_v2")
+    if st.button("🧪 Comparer V1 et V2", type="primary") and ticker:
+        with st.spinner("Comparaison causale en cours…"):
+            histories = load_timing_lab_histories((ticker,), periods[period_label])
+            history = histories.get(ticker, pd.DataFrame())
+            if len(history) < 220:
+                st.error("Historique insuffisant pour comparer les moteurs.")
+            else:
+                v1, v2 = _lab_eligible(history)
+                s1, stats1 = _lab_variant(v1, threshold1, v1)
+                s2, stats2 = _lab_variant(v2, threshold2, v2)
+                baseline = calculate_backtest_statistics(calculate_forward_returns(v1, v1))
+                st.dataframe(_lab_table(stats1, stats2, baseline), use_container_width=True, hide_index=True)
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Signaux V1", len(s1)); m2.metric("Signaux V2", len(s2))
+                common = s1.index.intersection(s2.index)
+                m3.metric("Signaux communs", len(common))
+                if warning := sample_size_warning(min(len(s1), len(s2))): st.warning(warning)
+                common_rows = v1.loc[common].copy()
+                common_stats = calculate_backtest_statistics(calculate_forward_returns(common_rows, v1))
+                st.caption("Convergence V1 + V2 — groupe exploratoire, qui ne constitue pas encore un troisième moteur. "
+                           f"Performance moyenne à 20 séances : {format_percentage(common_stats[20]['mean'])}.")
+                diagnostics = pd.DataFrame({
+                    "Groupe": ["V1", "V2"],
+                    "Distance moyenne MM50": [format_percentage(s1["distance_mm50"].mean()), format_percentage(s2["distance_mm50"].mean())],
+                    "RSI moyen": [f"{s1['RSI'].mean():.1f}" if len(s1) else "N/D", f"{s2['RSI'].mean():.1f}" if len(s2) else "N/D"],
+                    "Distance moyenne MM200": [format_percentage(s1["distance_mm200"].mean()), format_percentage(s2["distance_mm200"].mean())],
+                    "Distance au plus haut 20j": [format_percentage(v1.loc[s1.index, "close"].div(v1["close"].rolling(20).max().loc[s1.index]).sub(1).mean()),
+                                                  format_percentage(s2["distance_from_20d_high"].mean())],
+                })
+                st.markdown("#### Le signal détecte-t-il réellement un repli ?")
+                st.dataframe(diagnostics, use_container_width=True, hide_index=True)
+                horizons_won = [h for h in BACKTEST_HORIZONS if valid_number(stats1[h]["mean"]) and valid_number(stats2[h]["mean"]) and stats2[h]["mean"] > stats1[h]["mean"]]
+                if horizons_won and len(horizons_won) < len(BACKTEST_HORIZONS):
+                    st.info(f"V2 surperforme V1 à {', '.join(map(str, horizons_won))} séances, mais pas sur tous les horizons.")
+                else:
+                    st.info("Aucune conclusion ne doit reposer sur une seule moyenne ou un seul horizon.")
+                _render_lab_chart(v1, v2, s1, s2, threshold1, threshold2)
+
+    st.divider(); st.subheader("🌍 Validation multi-actions")
+    tickers_text = st.text_area("Tickers (15 maximum, séparés par espaces, virgules ou lignes)",
+                                "AAPL MSFT GOOGL NVDA JPM XOM KO SPY", key="lab_multi")
+    tokens = [item.strip().upper() for item in tickers_text.replace(",", " ").split() if item.strip()]
+    tickers = tuple(dict.fromkeys(tokens[:15]))
+    mc1, mc2, mc3 = st.columns(3)
+    multi_period_label = mc1.selectbox("Période commune", list(periods), index=2, key="lab_multi_period")
+    multi_v1 = mc2.slider("Seuil V1 commun", 40, 90, 70, key="lab_multi_v1")
+    multi_v2 = mc3.slider("Seuil V2 commun", 40, 90, 70, key="lab_multi_v2")
+    if st.button("🌍 Lancer la validation multi-actions") and tickers:
+        histories = load_timing_lab_histories(tickers, periods[multi_period_label])
+        rows, raw_stats = [], []
+        for symbol in tickers:
+            history = histories.get(symbol, pd.DataFrame())
+            if len(history) < 220: continue
+            v1, v2 = _lab_eligible(history)
+            s1, a = _lab_variant(v1, multi_v1, v1); s2, b = _lab_variant(v2, multi_v2, v2)
+            base = calculate_backtest_statistics(calculate_forward_returns(v1, v1))
+            rows.append({"Ticker": symbol, "Signaux V1": len(s1), "Signaux V2": len(s2),
+                         "V1 20j": format_percentage(a[20]["mean"]), "V2 20j": format_percentage(b[20]["mean"]),
+                         "Baseline 20j": format_percentage(base[20]["mean"]),
+                         "V1 positifs": f"{a[20]['positive']:.0%}" if valid_number(a[20]["positive"]) else "N/D",
+                         "V2 positifs": f"{b[20]['positive']:.0%}" if valid_number(b[20]["positive"]) else "N/D",
+                         "V1 60j": format_percentage(a[60]["mean"]), "V2 60j": format_percentage(b[60]["mean"])})
+            raw_stats.append((symbol, a, b, base, s1, s2))
+        if not rows:
+            st.error("Aucun historique exploitable.")
+        else:
+            st.caption(f"Validation sur {len(rows)} actifs — {multi_period_label}, mêmes seuils, horizons et espacement.")
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            aggregates = []
+            for horizon in BACKTEST_HORIZONS:
+                for label, index in (("V1", 1), ("V2", 2)):
+                    values = [(item[index][horizon]["mean"], item[index][horizon]["observations"]) for item in raw_stats
+                              if valid_number(item[index][horizon]["mean"]) and item[index][horizon]["observations"]]
+                    per_asset = sum(v for v, _ in values) / len(values) if values else None
+                    weighted = sum(v * n for v, n in values) / sum(n for _, n in values) if values else None
+                    aggregates.append({"Horizon": f"{horizon} séances", "Moteur": label,
+                                       "Moyenne par action": format_percentage(per_asset),
+                                       "Moyenne pondérée par signaux": format_percentage(weighted),
+                                       "Observations": sum(n for _, n in values)})
+            st.markdown("#### Deux agrégations complémentaires")
+            st.dataframe(pd.DataFrame(aggregates), use_container_width=True, hide_index=True)
+            comparable = [x for x in raw_stats if all(valid_number(y[20]["mean"]) for y in (x[1], x[2], x[3]))]
+            wins_v1 = sum(x[2][20]["mean"] > x[1][20]["mean"] for x in comparable)
+            wins_base = sum(x[2][20]["mean"] > x[3][20]["mean"] for x in comparable)
+            total_v2 = sum(x[2][20]["observations"] for x in raw_stats)
+            v2_medians = [x[2][20]["median"] for x in raw_stats if valid_number(x[2][20]["median"])]
+            v1_medians = [x[1][20]["median"] for x in raw_stats if valid_number(x[1][20]["median"])]
+            dd_ok = all(not (valid_number(x[1][20]["drawdown_mean"]) and valid_number(x[2][20]["drawdown_mean"]) and
+                            x[2][20]["drawdown_mean"] < x[1][20]["drawdown_mean"] - .03) for x in raw_stats)
+            encouraging = (len(comparable) > 0 and wins_v1 > len(comparable)/2 and wins_base > len(comparable)/2 and
+                           v2_medians and v1_medians and pd.Series(v2_medians).median() >= pd.Series(v1_medians).median() and
+                           dd_ok and total_v2 >= 30)
+            robustness = "Encourageante" if encouraging else "Mitigée" if total_v2 >= 10 else "Non concluante"
+            st.metric("Robustesse V2", robustness)
+            st.write(f"V2 > V1 sur **{wins_v1} / {len(comparable)}** actions après 20 séances.  \n"
+                     f"V2 > baseline sur **{wins_base} / {len(comparable)}** actions.")
+            if not encouraging: st.warning("La logique Repli + Reprise n'apporte pas d'amélioration claire et robuste sur cet échantillon.")
+            if warning := sample_size_warning(total_v2): st.warning(warning)
+    st.warning("Les règles V2 ont été définies avant observation de ce test. Ne modifiez pas immédiatement les seuils après chaque résultat : cela créerait un risque de sur-optimisation.")
+    st.info("Une future étape consistera à figer la meilleure variante puis à la tester sur une période / un univers non utilisé lors de sa conception.")
 
 
 def render_backtest() -> None:
@@ -2030,7 +2326,7 @@ if "analysis_ticker" not in st.session_state:
     st.session_state["analysis_ticker"] = "AAPL"
 with st.sidebar:
     navigation = st.radio(
-        "Mode", options=["📊 Analyse", "🥊 Comparateur", "🔎 Screener", "⭐ Watchlist", "🧪 Backtest"],
+        "Mode", options=["📊 Analyse", "🥊 Comparateur", "🔎 Screener", "⭐ Watchlist", "🧪 Backtest", "🧬 Timing Lab"],
         key="navigation_mode",
     )
     st.header("Paramètres d'analyse")
@@ -2077,5 +2373,7 @@ elif navigation == "🔎 Screener":
     render_screener(selected_mode)
 elif navigation == "⭐ Watchlist":
     render_watchlist(selected_mode)
-else:
+elif navigation == "🧪 Backtest":
     render_backtest()
+else:
+    render_timing_lab()
