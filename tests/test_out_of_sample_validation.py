@@ -10,6 +10,8 @@ import pandas as pd
 NAMES = {"valid_number", "calculate_alpha", "format_alpha", "split_validation_universes",
          "aggregate_out_of_sample", "out_of_sample_robustness",
          "build_out_of_sample_interpretation", "build_horizon_stability",
+         "build_v3_oos_interpretation", "aggregate_v3_confirmations",
+         "aggregate_unconfirmed_v3_alpha"}
          "build_v3_oos_interpretation", "aggregate_v3_confirmations"}
 tree = ast.parse(Path("app.py").read_text(encoding="utf-8"))
 nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in NAMES]
@@ -106,3 +108,15 @@ def test_confirmation_aggregation_uses_observed_pairs_only():
     assert result["early"] == 3 and result["confirmed"] == 2 and result["unconfirmed"] == 1
     assert result["rate"] == 2 / 3 and result["delay_mean"] == 5
     assert result["delay_median"] == 5 and abs(result["cost_mean"] - .005) < 1e-12
+
+
+def test_unconfirmed_alpha_is_aggregated_per_ticker_without_imputation():
+    raw = [
+        {"v3_unconfirmed": {20: {"mean": .04}}, "baseline": {20: {"mean": .02}}},
+        {"v3_unconfirmed": {20: {"mean": 0}}, "baseline": {20: {"mean": .01}}},
+        {"v3_unconfirmed": {20: {"mean": None}}, "baseline": {20: {"mean": .03}}},
+    ]
+    result = aggregate_unconfirmed_v3_alpha(raw)
+    assert result["assets"] == 2
+    assert abs(result["alpha_mean"] * 100 - .5) < 1e-12
+    assert abs(result["alpha_median"] * 100 - .5) < 1e-12

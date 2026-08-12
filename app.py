@@ -1520,6 +1520,21 @@ def aggregate_v3_confirmations(raw_stats: list[dict[str, Any]]) -> dict[str, Any
             "cost_median": costs.median() if len(costs) else None}
 
 
+def aggregate_unconfirmed_v3_alpha(raw_stats: list[dict[str, Any]]) -> dict[str, Any]:
+    """Agrège à poids égal les alphas 20j non confirmés disponibles par action."""
+    alphas = []
+    for item in raw_stats:
+        unconfirmed = item["v3_unconfirmed"][20]["mean"]
+        baseline = item["baseline"][20]["mean"]
+        alpha = calculate_alpha(unconfirmed, baseline)
+        if valid_number(alpha):
+            alphas.append(float(alpha))
+    values = pd.Series(alphas, dtype=float)
+    return {"alpha_mean": values.mean() if len(values) else None,
+            "alpha_median": values.median() if len(values) else None,
+            "assets": len(values)}
+
+
 def _render_out_of_sample_results(result: dict[str, Any]) -> None:
     raw_stats, conception_stats = result["validation"], result["conception"]
     ignored = result["ignored"]
@@ -1652,6 +1667,7 @@ def _render_out_of_sample_results(result: dict[str, Any]) -> None:
 
     st.markdown("### Setups Early non confirmés sous 15 séances")
     unconfirmed_row = {"Nombre": confirmations["unconfirmed"]}
+    unconfirmed_alpha = aggregate_unconfirmed_v3_alpha(raw_stats)
     for horizon in BACKTEST_HORIZONS:
         pieces = [(item["v3_unconfirmed"][horizon]["mean"], item["v3_unconfirmed"][horizon]["observations"])
                   for item in raw_stats if valid_number(item["v3_unconfirmed"][horizon]["mean"])]
@@ -1664,6 +1680,9 @@ def _render_out_of_sample_results(result: dict[str, Any]) -> None:
         unconfirmed_row[f"Performance moyenne {horizon}j"] = format_percentage(mean)
         unconfirmed_row[f"% positifs {horizon}j"] = f"{positive:.1%}" if valid_number(positive) else "N/D"
         if horizon == 20:
+            unconfirmed_row["Alpha moyen 20j"] = format_alpha(unconfirmed_alpha["alpha_mean"])
+            unconfirmed_row["Alpha médian 20j"] = format_alpha(unconfirmed_alpha["alpha_median"])
+            unconfirmed_row["Actions disponibles"] = unconfirmed_alpha["assets"]
             unconfirmed_row["Alpha 20j"] = format_alpha(calculate_alpha(mean, by_engine["V3 Early"][20]["baseline_mean"]))
     st.dataframe(pd.DataFrame([unconfirmed_row]), use_container_width=True, hide_index=True)
 
