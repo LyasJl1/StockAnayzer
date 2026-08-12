@@ -1218,6 +1218,12 @@ def split_validation_universes(conception: list[str], validation: list[str],
         tuple(symbol for symbol in candidates if symbol in designed_set)
 
 
+def timing_oos_signature(effective: tuple[str, ...], period: str,
+                         threshold1: int, threshold2: int) -> tuple[tuple[str, ...], str, int, int]:
+    """Construit une signature immuable et stable entre calcul et rendu Streamlit."""
+    return tuple(effective), str(period), int(threshold1), int(threshold2)
+
+
 def aggregate_out_of_sample(raw_stats: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Agrège sans imputation : une action pèse une fois, sauf l'alpha pondéré."""
     rows: list[dict[str, Any]] = []
@@ -1520,13 +1526,39 @@ def aggregate_v3_confirmations(raw_stats: list[dict[str, Any]]) -> dict[str, Any
             "cost_median": costs.median() if len(costs) else None}
 
 
+def aggregate_unconfirmed_v3_alpha(raw_stats: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    """Agrège les setups non confirmés en calculant d'abord l'alpha de chaque ticker."""
+    aggregated: dict[int, dict[str, Any]] = {}
+    for horizon in BACKTEST_HORIZONS:
+        ticker_rows = []
+        for item in raw_stats:
+            stats = item.get("v3_unconfirmed", {}).get(horizon, {})
+            baseline = item.get("baseline", {}).get(horizon, {})
+            alpha = calculate_alpha(stats.get("mean"), baseline.get("mean"))
+            if valid_number(alpha):
+                ticker_rows.append((float(stats["mean"]), float(alpha), int(stats.get("observations", 0))))
+        observations = sum(row[2] for row in ticker_rows)
+        aggregated[horizon] = {
+            "performance_mean": (sum(row[0] * row[2] for row in ticker_rows) / observations
+                                 if observations else None),
+            "alpha_mean": pd.Series([row[1] for row in ticker_rows], dtype=float).mean()
+            if ticker_rows else None,
+            "assets": len(ticker_rows),
+            "observations": observations,
+        }
+    return aggregated
+
+
 def _render_out_of_sample_results(result: dict[str, Any]) -> None:
     raw_stats, conception_stats = result["validation"], result["conception"]
     ignored = result["ignored"]
     if ignored:
         st.warning(f"{len(ignored)} ticker(s) ignorés faute de données suffisantes : {', '.join(ignored)}.")
     if not raw_stats:
-        st.error("Aucun historique hors échantillon exploitable.")
+        st.error("❌ Aucun actif hors échantillon n'a pu être calculé.")
+        st.write(f"Historiques téléchargés : **{result.get('downloaded_count', 0)}**")
+        st.write(f"Actifs ignorés : **{len(ignored)}**")
+        st.write(f"Tickers ignorés : **{', '.join(ignored) if ignored else 'Aucun'}**")
         return
     valid_assets = len(raw_stats)
     if valid_assets < 5:
@@ -1652,6 +1684,7 @@ def _render_out_of_sample_results(result: dict[str, Any]) -> None:
 
     st.markdown("### Setups Early non confirmés sous 15 séances")
     unconfirmed_row = {"Nombre": confirmations["unconfirmed"]}
+    unconfirmed_alpha = aggregate_unconfirmed_v3_alpha(raw_stats)
     for horizon in BACKTEST_HORIZONS:
         pieces = [(item["v3_unconfirmed"][horizon]["mean"], item["v3_unconfirmed"][horizon]["observations"])
                   for item in raw_stats if valid_number(item["v3_unconfirmed"][horizon]["mean"])]
@@ -1664,7 +1697,7 @@ def _render_out_of_sample_results(result: dict[str, Any]) -> None:
         unconfirmed_row[f"Performance moyenne {horizon}j"] = format_percentage(mean)
         unconfirmed_row[f"% positifs {horizon}j"] = f"{positive:.1%}" if valid_number(positive) else "N/D"
         if horizon == 20:
-            unconfirmed_row["Alpha 20j"] = format_alpha(calculate_alpha(mean, by_engine["V3 Early"][20]["baseline_mean"]))
+            unconfirmed_row["Alpha 20j"] = format_alpha(unconfirmed_alpha[horizon]["alpha_mean"])
     st.dataframe(pd.DataFrame([unconfirmed_row]), use_container_width=True, hide_index=True)
 
     st.markdown("#### Synthèse complète")
@@ -1879,21 +1912,48 @@ def render_timing_lab() -> None:
     oos_v2 = oc3.slider("Seuil V2 figé", 40, 90, 70, key="lab_oos_v2")
     st.caption(f"Espacement minimum inchangé : {MIN_SIGNAL_GAP} séances · Horizons : 5 / 20 / 60 séances · "
                "Aucun ajustement automatique par ticker.")
-    signature = (effective, periods[oos_period_label], oos_v1, oos_v2)
-    if st.button("🧪 Lancer la validation hors échantillon", type="primary", disabled=not effective):
-        with st.spinner("Validation causale groupée en cours…"):
+    signature = timing_oos_signature(effective, periods[oos_period_label], oos_v1, oos_v2)
+    validation_clicked = st.button(
+        "🧪 Lancer la validation hors échantillon", type="primary", disabled=not effective)
+    if validation_clicked:
+        progress = st.progress(0, text="1/4 Téléchargement des historiques")
+        try:
             all_tickers = tuple(dict.fromkeys((*conception, *effective)))
             histories = load_timing_lab_histories(all_tickers, periods[oos_period_label])
+            missing_histories = [ticker for ticker in all_tickers if ticker not in histories]
+            st.write(f"Historiques chargés : **{len(histories)} / {len(all_tickers)}**")
+            if missing_histories:
+                st.warning(f"Historiques absents : {', '.join(missing_histories)}.")
+            progress.progress(25, text=f"2/4 Calcul des {len(effective)} actions hors échantillon")
             validation_stats, ignored = _calculate_validation_assets(effective, histories, oos_v1, oos_v2)
-            conception_stats, _ = _calculate_validation_assets(tuple(conception), histories, oos_v1, oos_v2)
+            progress.progress(50, text="3/4 Calcul de l'univers de conception")
+            conception_stats, conception_ignored = _calculate_validation_assets(
+                tuple(conception), histories, oos_v1, oos_v2)
             st.session_state["timing_oos_result"] = {
                 "signature": signature, "validation": validation_stats, "conception": conception_stats,
                 "ignored": ignored,
+                "conception_ignored": conception_ignored,
+                "downloaded_count": len(histories), "requested_count": len(all_tickers),
+                "missing_histories": missing_histories,
             }
+            stored_after_calculation = st.session_state.get("timing_oos_result")
+            if not stored_after_calculation:
+                raise RuntimeError("Le résultat calculé n'a pas été conservé dans la session Streamlit.")
+            if stored_after_calculation.get("signature") != signature:
+                raise RuntimeError("La signature de validation a changé pendant le calcul.")
+            progress.progress(75, text="4/4 Rendu des résultats")
+            st.success(f"✅ Validation terminée — {len(validation_stats)} actifs hors échantillon analysés.")
+            _render_out_of_sample_results(stored_after_calculation)
+            progress.progress(100, text="4/4 Résultats prêts")
+        except Exception as exc:
+            st.error("La validation hors échantillon a échoué.")
+            st.exception(exc)
     stored = st.session_state.get("timing_oos_result")
-    if stored and stored.get("signature") == signature:
+    # Après un clic, le rendu (ou son erreur explicite) a déjà eu lieu dans le try.
+    if not validation_clicked and stored and stored.get("signature") == signature:
+        st.success(f"✅ Validation terminée — {len(stored.get('validation', []))} actifs hors échantillon analysés.")
         _render_out_of_sample_results(stored)
-    elif stored:
+    elif not validation_clicked and stored:
         st.info("Les paramètres ont changé. Relancez la validation pour obtenir des résultats comparables.")
     st.warning("Les règles V2 ont été définies avant observation de ce test. Ne modifiez pas immédiatement les seuils après chaque résultat : cela créerait un risque de sur-optimisation.")
     st.info("Une future étape consistera à figer la meilleure variante puis à la tester sur une période / un univers non utilisé lors de sa conception.")
