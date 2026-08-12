@@ -7,7 +7,7 @@ import json
 from datetime import date, datetime, timedelta, timezone
 from html import escape
 from math import isfinite, sqrt
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -1097,8 +1097,8 @@ def calculate_rigorous_entry_v3(data: pd.DataFrame) -> dict[str, Any]:
                         "available_points": regime["available_points"] + setup["available_points"] + trigger["available_points"]}}
 
 
-def calculate_v3_timing_series(data: pd.DataFrame) -> pd.DataFrame:
-    """Construit les états V3 causaux et les événements Early / Confirmed."""
+def calculate_v3_timing_series_reference(data: pd.DataFrame) -> pd.DataFrame:
+    """Implémentation historique de référence, conservée pour les tests de parité."""
     frame = _v3_prepared(data)
     rows = []
     for position in range(len(frame)):
@@ -1111,6 +1111,87 @@ def calculate_v3_timing_series(data: pd.DataFrame) -> pd.DataFrame:
     eligible = (series["regime_status"] == "Favorable") & (series["setup_status"] == "Présent")
     early_state = eligible & (series["trigger_status"] == "Partiel")
     confirmed_state = eligible & (series["trigger_status"] == "Fort")
+    series["v3_early"] = early_state & ~early_state.shift(1, fill_value=False)
+    series["v3_confirmed"] = confirmed_state & ~confirmed_state.shift(1, fill_value=False)
+    return series
+
+
+def calculate_v3_timing_series(data: pd.DataFrame) -> pd.DataFrame:
+    """Construit en O(n) les mêmes états V3 causaux que l'implémentation de référence."""
+    frame = _v3_prepared(data)
+    if frame.empty:
+        return pd.DataFrame()
+    close, mm50, mm200 = frame["Close"], frame["MM50"], frame["MM200"]
+    rsi, macd, signal, atr = frame["RSI"], frame["MACD"], frame["Signal"], frame["ATR14"]
+
+    regime_available = pd.concat((close.notna() & mm200.notna(),
+                                  mm50.notna() & mm200.notna(),
+                                  mm200.notna() & mm200.shift(20).notna()), axis=1)
+    regime_passed = pd.concat((close > mm200, mm50 > mm200, mm200 > mm200.shift(20)), axis=1)
+    regime_count = regime_available.sum(axis=1)
+    regime_ratio = regime_passed.where(regime_available, False).sum(axis=1).div(regime_count.where(regime_count.gt(0)))
+    regime_status = pd.Series("Défavorable", index=frame.index, dtype=object)
+    regime_status.mask(regime_ratio >= 2 / 3, "Mitigé", inplace=True)
+    regime_status.mask(regime_ratio >= 1, "Favorable", inplace=True)
+    regime_status.mask(regime_count.eq(0), "N/D", inplace=True)
+    regime_score = (regime_passed.iloc[:, 0].astype(float) * 15 +
+                    regime_passed.iloc[:, 1].astype(float) * 15 +
+                    regime_passed.iloc[:, 2].astype(float) * 10)
+
+    distance = close.div(mm50).sub(1).where(mm50.ne(0))
+    distance_200 = close.div(mm200).sub(1).where(mm200.ne(0))
+    extended = (distance_200 > .35) | (distance > .20)
+    atr_distance = close.sub(mm50).abs().div(atr).where(atr.gt(0))
+    distance_points = pd.Series(0.0, index=frame.index)
+    distance_points.mask(distance.between(-.08, -.05, inclusive="left"), 9, inplace=True)
+    distance_points.mask(distance.between(.03, .08, inclusive="right"), 6, inplace=True)
+    distance_points.mask(distance.between(-.05, .03, inclusive="both"), 15, inplace=True)
+    rsi_points = pd.Series(0.0, index=frame.index)
+    rsi_points.mask(rsi.between(32, 55, inclusive="both"), 6, inplace=True)
+    rsi_points.mask(rsi.between(38, 50, inclusive="both"), 10, inplace=True)
+    atr_points = pd.Series(0.0, index=frame.index)
+    atr_points.mask(atr_distance <= 2, 3, inplace=True)
+    atr_points.mask(atr_distance <= 1, 5, inplace=True)
+    setup_available = distance.notna() | rsi.notna() | atr_distance.notna()
+    setup_present = (regime_status.isin(("Favorable", "Mitigé")) & distance.between(-.05, .03) &
+                     rsi.between(35, 52) & ~extended)
+    setup_convergence = (distance.between(-.05, .03).astype(int) + rsi.between(35, 52).astype(int) +
+                         atr_distance.le(2).fillna(False).astype(int))
+    setup_possible = regime_status.isin(("Favorable", "Mitigé")) & setup_convergence.ge(2) & ~extended
+    setup_status = pd.Series("Absent", index=frame.index, dtype=object)
+    setup_status.mask(setup_possible, "Possible", inplace=True)
+    setup_status.mask(setup_present, "Présent", inplace=True)
+    setup_status.mask(~setup_available, "N/D", inplace=True)
+    setup_score = distance_points + rsi_points + atr_points
+
+    gap = macd - signal
+    previous_available = (close.shift(1).notna() & mm50.shift(1).notna()).astype(int).rolling(5, min_periods=1).max()
+    previous_below = ((close.shift(1) < mm50.shift(1)).astype(int).rolling(5, min_periods=1).max().eq(1))
+    trigger_available = pd.concat((close.notna() & close.shift(3).notna() & close.shift(1).notna(),
+                                   rsi.notna() & rsi.shift(3).notna(),
+                                   gap.notna() & gap.shift(3).notna() & gap.shift(5).notna(),
+                                   macd.notna() & signal.notna(),
+                                   close.notna() & mm50.notna() & previous_available.eq(1)), axis=1)
+    trigger_passed = pd.concat(((close > close.shift(3)) & (close > close.shift(1)),
+                                (rsi > rsi.shift(3)) & (rsi >= 42),
+                                (gap > gap.shift(3)) & (gap > gap.shift(5)),
+                                macd > signal, (close > mm50) & previous_below), axis=1)
+    passed_count = trigger_passed.where(trigger_available, False).sum(axis=1)
+    trigger_status = pd.Series("Absent", index=frame.index, dtype=object)
+    trigger_status.mask(passed_count.ge(1), "Partiel", inplace=True)
+    trigger_status.mask(passed_count.ge(3), "Fort", inplace=True)
+    trigger_status.mask(trigger_available.sum(axis=1).eq(0), "N/D", inplace=True)
+    trigger_score = (trigger_passed.iloc[:, 0].astype(float) * 7 + trigger_passed.iloc[:, 1].astype(float) * 6 +
+                     trigger_passed.iloc[:, 2].astype(float) * 7 + trigger_passed.iloc[:, 3].astype(float) * 5 +
+                     trigger_passed.iloc[:, 4].astype(float) * 5)
+    strength = regime_score + setup_score + trigger_score
+    strength = strength.where(regime_status.ne("Défavorable"), strength.clip(upper=55))
+    series = pd.DataFrame({"date": frame.index, "close": close, "regime_status": regime_status,
+                           "setup_status": setup_status, "trigger_status": trigger_status,
+                           "v3_signal_strength": strength.astype(float), "_position": range(len(frame))},
+                          index=frame.index)
+    eligible = regime_status.eq("Favorable") & setup_status.eq("Présent")
+    early_state, confirmed_state = eligible & trigger_status.eq("Partiel"), eligible & trigger_status.eq("Fort")
     series["v3_early"] = early_state & ~early_state.shift(1, fill_value=False)
     series["v3_confirmed"] = confirmed_state & ~confirmed_state.shift(1, fill_value=False)
     return series
@@ -1439,17 +1520,21 @@ def _lab_table(stats1: dict[str, Any], stats2: dict[str, Any],
 
 
 def _calculate_validation_assets(tickers: tuple[str, ...], histories: dict[str, pd.DataFrame],
-                                 threshold1: float, threshold2: float) -> tuple[list[dict[str, Any]], list[str]]:
+                                 threshold1: float, threshold2: float,
+                                 progress_callback: Callable[[str, int, int], None] | None = None,
+                                 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Mesure les quatre signaux sur une fenêtre, une baseline et un warm-up identiques."""
     results, ignored = [], []
     for symbol in tickers:
         history = histories.get(symbol, pd.DataFrame())
         if len(history) < 220:
             ignored.append(symbol)
+            if progress_callback: progress_callback(symbol, len(results) + len(ignored), len(tickers))
             continue
         v1, v2 = _lab_eligible(history)
         if v1.empty or v2.empty:
             ignored.append(symbol)
+            if progress_callback: progress_callback(symbol, len(results) + len(ignored), len(tickers))
             continue
         s1, stats1 = _lab_variant(v1, threshold1, v1)
         s2, stats2 = _lab_variant(v2, threshold2, v2)
@@ -1471,6 +1556,7 @@ def _calculate_validation_assets(tickers: tuple[str, ...], histories: dict[str, 
                         "signals_V3 Early": len(early), "signals_V3 Confirmed": len(confirmed),
                         "v3_confirmation": confirmation,
                         "v3_unconfirmed": unconfirmed_stats})
+        if progress_callback: progress_callback(symbol, len(results) + len(ignored), len(tickers))
     return results, ignored
 
 
@@ -1925,6 +2011,17 @@ def render_timing_lab() -> None:
             if missing_histories:
                 st.warning(f"Historiques absents : {', '.join(missing_histories)}.")
             progress.progress(25, text=f"2/4 Calcul des {len(effective)} actions hors échantillon")
+            validation_stats, ignored = _calculate_validation_assets(
+                effective, histories, oos_v1, oos_v2,
+                lambda symbol, done, total: progress.progress(
+                    25 + int(25 * done / max(total, 1)),
+                    text=f"2/4 Calcul hors échantillon : {done} / {total} actions — {symbol} terminé"))
+            progress.progress(50, text="3/4 Calcul de l'univers de conception")
+            conception_stats, conception_ignored = _calculate_validation_assets(
+                tuple(conception), histories, oos_v1, oos_v2,
+                lambda symbol, done, total: progress.progress(
+                    50 + int(25 * done / max(total, 1)),
+                    text=f"3/4 Calcul conception : {done} / {total} actions — {symbol} terminé"))
             validation_stats, ignored = _calculate_validation_assets(effective, histories, oos_v1, oos_v2)
             progress.progress(50, text="3/4 Calcul de l'univers de conception")
             conception_stats, conception_ignored = _calculate_validation_assets(

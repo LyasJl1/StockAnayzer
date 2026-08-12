@@ -5,12 +5,14 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import pandas.testing as pdt
 
 
 NAMES = {"valid_number", "calculate_atr", "_v3_prepared", "_v3_condition",
          "evaluate_v3_regime", "evaluate_v3_setup", "evaluate_v3_trigger",
          "build_v3_entry_status", "calculate_rigorous_entry_v3",
-         "calculate_v3_timing_series", "extract_v3_signals", "analyze_v3_confirmations"}
+         "calculate_v3_timing_series_reference", "calculate_v3_timing_series",
+         "extract_v3_signals", "analyze_v3_confirmations"}
 tree = ast.parse(Path("app.py").read_text(encoding="utf-8"))
 nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in NAMES]
 namespace = {"pd": pd, "Any": Any, "isfinite": isfinite, "sqrt": sqrt, "MIN_SIGNAL_GAP": 10}
@@ -63,6 +65,32 @@ def test_future_mutation_does_not_change_v3_at_t():
             before["trigger"]["status"], before["metrics"]["v3_signal_strength"]) == \
            (after["regime"]["status"], after["setup"]["status"],
             after["trigger"]["status"], after["metrics"]["v3_signal_strength"])
+
+
+def test_vectorized_series_has_strict_reference_parity_and_no_look_ahead():
+    exact = ["regime_status", "setup_status", "trigger_status", "v3_early", "v3_confirmed"]
+    datasets = []
+    for offset in (0, 3, 7):
+        data = scenario()
+        # Trois historiques déterministes exercent des états et transitions différents.
+        wave = pd.Series([(((i + offset) % 17) - 8) * .12 for i in range(len(data))], index=data.index)
+        data["Close"] += wave
+        data["High"], data["Low"] = data["Close"] + 1, data["Close"] - 1
+        datasets.append(data)
+        reference = calculate_v3_timing_series_reference(data)
+        vectorized = calculate_v3_timing_series(data)
+        pdt.assert_frame_equal(reference[exact], vectorized[exact], check_dtype=False)
+        pdt.assert_series_equal(reference["v3_signal_strength"], vectorized["v3_signal_strength"],
+                                check_exact=False, atol=1e-10, rtol=0)
+
+    cutoff = 245
+    data = datasets[0]
+    changed = data.copy()
+    changed.iloc[cutoff + 1:, changed.columns.get_loc("Close")] *= 10
+    changed.iloc[cutoff + 1:, changed.columns.get_loc("High")] *= 10
+    changed.iloc[cutoff + 1:, changed.columns.get_loc("Low")] *= 10
+    before, after = calculate_v3_timing_series(data), calculate_v3_timing_series(changed)
+    pdt.assert_series_equal(before.iloc[cutoff], after.iloc[cutoff])
 
 
 def test_unconfirmed_early_is_marked_after_fifteen_sessions():
