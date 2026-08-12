@@ -8,9 +8,11 @@ import pandas as pd
 
 
 NAMES = {"valid_number", "calculate_alpha", "format_alpha", "split_validation_universes",
+         "timing_oos_signature",
          "aggregate_out_of_sample", "out_of_sample_robustness",
          "build_out_of_sample_interpretation", "build_horizon_stability",
-         "build_v3_oos_interpretation", "aggregate_v3_confirmations"}
+         "build_v3_oos_interpretation", "aggregate_v3_confirmations",
+         "aggregate_unconfirmed_v3_alpha", "_render_out_of_sample_results"}
 tree = ast.parse(Path("app.py").read_text(encoding="utf-8"))
 nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in NAMES]
 namespace = {"pd": pd, "Any": Any, "isfinite": isfinite, "BACKTEST_HORIZONS": (5, 20, 60)}
@@ -106,3 +108,70 @@ def test_confirmation_aggregation_uses_observed_pairs_only():
     assert result["early"] == 3 and result["confirmed"] == 2 and result["unconfirmed"] == 1
     assert result["rate"] == 2 / 3 and result["delay_mean"] == 5
     assert result["delay_median"] == 5 and abs(result["cost_mean"] - .005) < 1e-12
+
+
+class StreamlitRecorder:
+    def __init__(self):
+        self.calls = []
+
+    def __getattr__(self, name):
+        def record(*args, **kwargs):
+            self.calls.append((name, args, kwargs))
+        return record
+
+
+def test_empty_validation_displays_explicit_diagnostics():
+    recorder = StreamlitRecorder()
+    old_st = _render_out_of_sample_results.__globals__.get("st")
+    _render_out_of_sample_results.__globals__["st"] = recorder
+    try:
+        _render_out_of_sample_results({
+            "validation": [], "conception": [], "ignored": ["META", "AMZN"],
+            "downloaded_count": 2,
+        })
+    finally:
+        _render_out_of_sample_results.__globals__["st"] = old_st
+    messages = [args[0] for _, args, _ in recorder.calls if args]
+    assert "❌ Aucun actif hors échantillon n'a pu être calculé." in messages
+    assert any("META, AMZN" in message for message in messages)
+
+
+def test_valid_result_aggregation_is_renderable_with_empty_horizons():
+    raw = [asset("META", .04, .03, .02, missing_60=True)]
+    summaries = aggregate_out_of_sample(raw)
+    assert len(summaries) == 12
+    assert all("alpha_mean" in row for row in summaries)
+
+
+def test_validation_exception_is_reported_and_render_is_immediate():
+    source = Path("app.py").read_text(encoding="utf-8")
+    lab = next(node for node in ast.parse(source).body
+               if isinstance(node, ast.FunctionDef) and node.name == "render_timing_lab")
+    handlers = [handler for node in ast.walk(lab) if isinstance(node, ast.Try)
+                for handler in node.handlers]
+    handler_calls = {call.func.attr for handler in handlers for call in ast.walk(handler)
+                     if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)}
+    assert {"error", "exception"} <= handler_calls
+    assert source.index('st.session_state["timing_oos_result"] = {') < \
+        source.index("_render_out_of_sample_results(stored_after_calculation)")
+
+
+def test_signature_is_immutable_and_stable():
+    effective = ("META", "AMZN")
+    before = timing_oos_signature(effective, "3y", 70, 70)
+    after = timing_oos_signature(tuple(effective), str("3y"), int(70), int(70))
+    assert before == after == (("META", "AMZN"), "3y", 70, 70)
+
+
+def test_unconfirmed_v3_alpha_is_aggregated_ticker_by_ticker():
+    raw = []
+    for ticker, performance, baseline, observations in (
+            ("META", .10, .02, 1), ("AMZN", .04, .03, 9)):
+        item = {"ticker": ticker, "v3_unconfirmed": {}, "baseline": {}}
+        for horizon in (5, 20, 60):
+            item["v3_unconfirmed"][horizon] = stats(performance, observations)
+            item["baseline"][horizon] = stats(baseline, 100)
+        raw.append(item)
+    result = aggregate_unconfirmed_v3_alpha(raw)[20]
+    # Moyenne égale des alphas par ticker : ((10-2) + (4-3)) / 2 = 4,5 points.
+    assert abs(result["alpha_mean"] - .045) < 1e-12
