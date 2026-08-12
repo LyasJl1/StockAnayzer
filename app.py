@@ -7,6 +7,7 @@ import json
 from datetime import date, datetime, timedelta, timezone
 from html import escape
 from math import isfinite, sqrt
+from time import perf_counter
 from typing import Any
 
 import pandas as pd
@@ -1208,6 +1209,133 @@ def format_alpha(value: Any) -> str:
     return f"{float(value) * 100:+.1f} pt" if valid_number(value) else "N/D"
 
 
+def build_walk_forward_windows(start: Any, end: Any, observation_years: int = 3,
+                               validation_years: int = 1, step_years: int = 1) -> list[dict[str, Any]]:
+    """Construit des fenêtres calendaires glissantes, sans chevauchement observation/validation."""
+    start, end = pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize()
+    if observation_years < 1 or validation_years < 1 or step_years < 1 or start > end:
+        return []
+    windows, observation_start = [], start
+    while True:
+        validation_start = observation_start + pd.DateOffset(years=observation_years)
+        validation_end = validation_start + pd.DateOffset(years=validation_years) - pd.Timedelta(days=1)
+        if validation_end > end:
+            break
+        windows.append({
+            "window": f"{validation_start:%Y-%m-%d} → {validation_end:%Y-%m-%d}",
+            "observation_start": observation_start, "observation_end": validation_start - pd.Timedelta(days=1),
+            "validation_start": validation_start, "validation_end": validation_end,
+        })
+        observation_start += pd.DateOffset(years=step_years)
+    return windows
+
+
+def _bounded_window_statistics(observations: pd.DataFrame, timeline: pd.DataFrame,
+                               validation_start: Any, validation_end: Any) -> dict[int, dict[str, Any]]:
+    """Mesure les horizons sans jamais dépasser la dernière séance de validation."""
+    start, end = pd.Timestamp(validation_start), pd.Timestamp(validation_end)
+    eligible = observations.loc[(observations.index >= start) & (observations.index <= end)].copy()
+    closes = timeline["close"].reset_index(drop=True)
+    last_positions = timeline.loc[timeline.index <= end, "_position"]
+    last = int(last_positions.max()) if not last_positions.empty else -1
+    result: dict[int, dict[str, Any]] = {}
+    for horizon in BACKTEST_HORIZONS:
+        returns, drawdowns = [], []
+        for position in eligible.get("_position", pd.Series(dtype=int)).astype(int):
+            if position + horizon > last or position + horizon >= len(closes):
+                continue
+            reference, future = closes.iloc[position], closes.iloc[position + horizon]
+            if not valid_number(reference) or not valid_number(future) or not reference:
+                continue
+            returns.append(float(future) / float(reference) - 1)
+            path = closes.iloc[position:position + horizon + 1].dropna()
+            drawdowns.append(float(path.min()) / float(reference) - 1)
+        series, dd = pd.Series(returns, dtype=float), pd.Series(drawdowns, dtype=float)
+        result[horizon] = {
+            "observations": len(series), "mean": series.mean() if len(series) else None,
+            "median": series.median() if len(series) else None,
+            "positive": (series > 0).mean() if len(series) else None,
+            "drawdown_mean": dd.mean() if len(dd) else None,
+            "drawdown_worst": dd.min() if len(dd) else None,
+        }
+    return result
+
+
+def calculate_walk_forward(history: pd.DataFrame, ticker: str, windows: list[dict[str, Any]],
+                           engines: tuple[str, ...]) -> list[dict[str, Any]]:
+    """Pré-calcule chaque moteur une fois, puis découpe uniquement les validations futures."""
+    v1 = calculate_historical_timing_series(history, "Investisseur")
+    v2 = calculate_pullback_timing_series(history).reindex(v1.index)
+    v3 = calculate_v3_timing_series(history).reindex(v1.index)
+    # Extraction sur la série complète : dates et espacement sont identiques au Timing Lab normal.
+    signals = {
+        "V1": extract_threshold_signals(v1, 70), "V2": extract_threshold_signals(v2, 70),
+        "V3 Early": extract_v3_signals(v3, "early"),
+        "V3 Confirmed": extract_v3_signals(v3, "confirmed"),
+    }
+    rows = []
+    for window in windows:
+        baseline = _bounded_window_statistics(v1, v1, window["validation_start"], window["validation_end"])
+        for engine in engines:
+            stats = _bounded_window_statistics(signals[engine], v1,
+                                               window["validation_start"], window["validation_end"])
+            for horizon in BACKTEST_HORIZONS:
+                item, base = stats[horizon], baseline[horizon]
+                rows.append({
+                    "Ticker": ticker, "Fenêtre": window["window"],
+                    "Début validation": window["validation_start"], "Fin validation": window["validation_end"],
+                    "Moteur": engine, "Horizon": horizon, "Signaux": item["observations"],
+                    "Performance moyenne": item["mean"], "Médiane": item["median"],
+                    "% positifs": item["positive"], "Baseline": base["mean"],
+                    "Alpha": calculate_alpha(item["mean"], base["mean"]),
+                    "Alpha médian": calculate_alpha(item["median"], base["median"]),
+                    "Drawdown": item["drawdown_mean"], "Pire drawdown": item["drawdown_worst"],
+                    "Drawdown baseline": base["drawdown_mean"],
+                })
+    return rows
+
+
+def aggregate_walk_forward(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    """Distingue moyenne par fenêtre, médiane et moyenne pondérée par observations."""
+    frame, output = pd.DataFrame(rows), []
+    if frame.empty:
+        return pd.DataFrame()
+    for (engine, horizon), group in frame.groupby(["Moteur", "Horizon"], sort=False):
+        valid = group.dropna(subset=["Alpha"])
+        weights = valid["Signaux"].clip(lower=0)
+        output.append({"Moteur": engine, "Horizon": horizon, "Alpha moyen": valid["Alpha"].mean(),
+                       "Alpha médian": valid["Alpha"].median(),
+                       "Alpha pondéré": ((valid["Alpha"] * weights).sum() / weights.sum()
+                                           if weights.sum() else None),
+                       "Fenêtres positives": int((valid["Alpha"] > 0).sum()),
+                       "Fenêtres valides": len(valid), "Observations": int(valid["Signaux"].sum())})
+    return pd.DataFrame(output)
+
+
+def walk_forward_robustness(summary: dict[str, Any], ticker_positive_ratio: float,
+                            drawdown_ok: bool) -> str:
+    enough = summary.get("Observations", 0) >= 30 and summary.get("Fenêtres valides", 0) >= 2
+    positive_windows = (summary.get("Fenêtres positives", 0) / summary.get("Fenêtres valides", 1)) > .5
+    encouraging = (valid_number(summary.get("Alpha moyen")) and summary["Alpha moyen"] > 0 and
+                   valid_number(summary.get("Alpha médian")) and summary["Alpha médian"] > 0 and
+                   positive_windows and ticker_positive_ratio > .5 and enough and drawdown_ok)
+    if encouraging:
+        return "Encourageante"
+    if not valid_number(summary.get("Alpha moyen")) or summary.get("Alpha moyen", 0) <= 0:
+        return "Faible"
+    return "Mitigée"
+
+
+def build_walk_forward_interpretation(engine: str, summary: dict[str, Any]) -> str:
+    """Produit une lecture descriptive déterministe, sans vocabulaire prédictif."""
+    valid, positive = summary.get("Fenêtres valides", 0), summary.get("Fenêtres positives", 0)
+    if valid_number(summary.get("Alpha moyen")) and summary["Alpha moyen"] > 0 and positive > valid / 2:
+        return (f"{engine} conserve un alpha moyen positif sur les fenêtres futures et reste positif sur "
+                "la majorité des périodes testées. Le résultat reste historique et ne garantit pas les performances futures.")
+    return (f"{engine} ne conserve pas d'avantage temporel stable : l'alpha moyen est négatif ou nul, "
+            "ou la majorité des fenêtres ne battent pas la baseline.")
+
+
 def split_validation_universes(conception: list[str], validation: list[str],
                                limit: int = 20) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Déduplique les univers et retire systématiquement leur chevauchement."""
@@ -1753,6 +1881,113 @@ def _render_out_of_sample_results(result: dict[str, Any]) -> None:
     st.download_button("⬇️ Exporter la validation hors échantillon", export.to_csv(index=False).encode("utf-8"),
                        "timing_out_of_sample_validation.csv", "text/csv")
     st.info("Validation descriptive uniquement : aucune règle, aucun seuil et aucun ticker n'ont été optimisés.")
+
+def render_walk_forward_validation() -> None:
+    """Interface du test temporel, sans entraînement ni sélection de paramètres."""
+    st.title("⏩ Walk-Forward Validation")
+    st.caption("Validation temporelle descriptive : les règles restent figées et seules les périodes futures sont mesurées.")
+    st.info("Aucun ré-entraînement, grid search ou ajustement automatique de seuil n'est effectué.")
+    tickers_text = st.text_area("Tickers", "AAPL\nMSFT\nGOOGL\nNVDA\nJPM\nXOM\nKO\nSPY", key="wf_tickers")
+    tickers = tuple(parse_custom_tickers(tickers_text, limit=20))
+    c1, c2, c3, c4 = st.columns(4)
+    period_label = c1.selectbox("Période totale", ["3 ans", "5 ans"], index=1, key="wf_period")
+    observation = c2.number_input("Durée observation (ans)", 1, 5, 3, key="wf_observation")
+    validation = c3.number_input("Durée validation (ans)", 1, 3, 1, key="wf_validation")
+    step = c4.number_input("Step (ans)", 1, 3, 1, key="wf_step")
+    engines = tuple(st.multiselect("Moteurs à comparer", ["V1", "V2", "V3 Early", "V3 Confirmed"],
+                                     default=["V1", "V2", "V3 Early", "V3 Confirmed"], key="wf_engines"))
+    signature = (tickers, period_label, int(observation), int(validation), int(step), engines)
+    clicked = st.button("⏩ Lancer le walk-forward", type="primary", disabled=not tickers or not engines)
+    if clicked:
+        progress = st.progress(0, text="1/3 chargement")
+        started = perf_counter()
+        try:
+            histories = load_timing_lab_histories(tickers, "5y" if period_label == "5 ans" else "3y")
+            loaded_at = perf_counter()
+            progress.progress(34, text="2/3 calcul moteurs")
+            rows, window_count = [], 0
+            for number, ticker in enumerate(tickers, 1):
+                progress.progress(34 + int(55 * (number - 1) / len(tickers)),
+                                  text=f"2/3 calcul moteurs · Ticker {number} / {len(tickers)}")
+                history = histories.get(ticker, pd.DataFrame())
+                if history.empty:
+                    st.warning(f"{ticker} : historique indisponible.")
+                    continue
+                analysis_start = history.attrs.get("analysis_start", history.index.min())
+                windows = build_walk_forward_windows(analysis_start, history.index.max(), int(observation),
+                                                     int(validation), int(step))
+                window_count = max(window_count, len(windows))
+                rows.extend(calculate_walk_forward(history, ticker, windows, engines))
+            calculated_at = perf_counter()
+            progress.progress(90, text="3/3 agrégation walk-forward")
+            summary = aggregate_walk_forward(rows)
+            st.session_state["walk_forward_result"] = {
+                "signature": signature, "rows": rows, "summary": summary,
+                "timings": {"chargement": loaded_at - started, "moteurs": calculated_at - loaded_at,
+                            "agrégation": perf_counter() - calculated_at, "total": perf_counter() - started},
+                "windows": window_count,
+            }
+            progress.progress(100, text="3/3 agrégation walk-forward · terminé")
+        except Exception as exc:
+            st.error("Le walk-forward a échoué.")
+            st.exception(exc)
+    stored = st.session_state.get("walk_forward_result")
+    if not stored or stored.get("signature") != signature:
+        if stored:
+            st.info("Les paramètres ont changé. Relancez le walk-forward.")
+        return
+    rows, summary = stored["rows"], stored["summary"]
+    if not rows or summary.empty:
+        st.warning("Aucune fenêtre complète n'est disponible avec ces paramètres.")
+        return
+    frame = pd.DataFrame(rows)
+    main = frame[(frame["Horizon"] == 20) & frame["Alpha"].notna()].copy()
+    main["Fenêtre / Moteur"] = main["Fenêtre"] + " · " + main["Moteur"]
+    for column in ("Alpha", "Alpha médian", "% positifs", "Drawdown"):
+        main[column] = main[column].map(format_percentage)
+    st.subheader("Résultats par fenêtre — 20 séances")
+    st.dataframe(main[["Ticker", "Fenêtre / Moteur", "Alpha", "Alpha médian", "Signaux", "% positifs", "Drawdown"]],
+                 use_container_width=True, hide_index=True)
+    s20 = summary[summary["Horizon"] == 20].copy()
+    for column in ("Alpha moyen", "Alpha médian", "Alpha pondéré"):
+        s20[column] = s20[column].map(format_percentage)
+    s20["Fenêtres alpha +"] = s20["Fenêtres positives"].astype(str) + " / " + s20["Fenêtres valides"].astype(str)
+    st.subheader("Stabilité dans le temps et alpha walk-forward")
+    st.dataframe(s20[["Moteur", "Alpha moyen", "Alpha médian", "Alpha pondéré", "Fenêtres alpha +", "Observations"]],
+                 use_container_width=True, hide_index=True)
+    ticker_rows = []
+    for (ticker, engine), group in main.groupby(["Ticker", "Moteur"]):
+        numeric = frame[(frame["Ticker"] == ticker) & (frame["Moteur"] == engine) &
+                        (frame["Horizon"] == 20)].dropna(subset=["Alpha"])
+        ticker_rows.append({"Ticker": ticker, "Moteur": engine, "Fenêtres valides": len(numeric),
+                            "Alpha moyen 20j": format_percentage(numeric["Alpha"].mean()),
+                            "Fenêtres alpha +": f"{int((numeric['Alpha'] > 0).sum())} / {len(numeric)}"})
+    st.subheader("Stabilité par action")
+    st.dataframe(pd.DataFrame(ticker_rows), use_container_width=True, hide_index=True)
+    comparison = summary.pivot(index="Moteur", columns="Horizon", values="Alpha moyen").reset_index()
+    comparison = comparison.rename(columns={5: "Alpha moy. 5j", 20: "Alpha moy. 20j", 60: "Alpha moy. 60j"})
+    comparison = comparison.merge(summary[summary["Horizon"] == 20][["Moteur", "Fenêtres positives", "Fenêtres valides"]], on="Moteur")
+    comparison["Fenêtres alpha + 20j"] = comparison["Fenêtres positives"].astype(str) + " / " + comparison["Fenêtres valides"].astype(str)
+    for column in ("Alpha moy. 5j", "Alpha moy. 20j", "Alpha moy. 60j"):
+        comparison[column] = comparison[column].map(format_percentage)
+    st.subheader("Comparaison des moteurs")
+    st.dataframe(comparison[["Moteur", "Alpha moy. 5j", "Alpha moy. 20j", "Alpha moy. 60j", "Fenêtres alpha + 20j"]],
+                 use_container_width=True, hide_index=True)
+    for _, item in summary[summary["Horizon"] == 20].iterrows():
+        ticker_means = frame[(frame["Moteur"] == item["Moteur"]) & (frame["Horizon"] == 20)].groupby("Ticker")["Alpha"].mean().dropna()
+        ratio = (ticker_means > 0).mean() if len(ticker_means) else 0
+        engine_rows = frame[(frame["Moteur"] == item["Moteur"]) & (frame["Horizon"] == 20)]
+        dd_ok = not ((engine_rows["Drawdown"] < engine_rows["Drawdown baseline"] - .03).mean() > .5)
+        st.markdown(f"**{item['Moteur']} — Robustesse {walk_forward_robustness(item.to_dict(), ratio, dd_ok)}**")
+        st.caption(build_walk_forward_interpretation(item["Moteur"], item.to_dict()))
+    timings = stored["timings"]
+    st.caption(f"Temps : chargement {timings['chargement']:.2f}s · moteurs {timings['moteurs']:.2f}s · "
+               f"agrégation {timings['agrégation']:.2f}s · total {timings['total']:.2f}s")
+    export_columns = ["Ticker", "Fenêtre", "Début validation", "Fin validation", "Moteur", "Horizon", "Signaux",
+                      "Performance moyenne", "Médiane", "Baseline", "Alpha", "Drawdown"]
+    st.download_button("⬇️ Exporter les résultats walk-forward", frame[export_columns].to_csv(index=False).encode("utf-8"),
+                       "walk_forward_validation.csv", "text/csv")
+
 
 def render_timing_lab() -> None:
     """Interface expérimentale comparant V1 et V2 inchangées à V3."""
@@ -3103,7 +3338,7 @@ if "analysis_ticker" not in st.session_state:
     st.session_state["analysis_ticker"] = "AAPL"
 with st.sidebar:
     navigation = st.radio(
-        "Mode", options=["📊 Analyse", "🥊 Comparateur", "🔎 Screener", "⭐ Watchlist", "🧪 Backtest", "🧬 Timing Lab"],
+        "Mode", options=["📊 Analyse", "🥊 Comparateur", "🔎 Screener", "⭐ Watchlist", "🧪 Backtest", "🧬 Timing Lab", "⏩ Walk-Forward Validation"],
         key="navigation_mode",
     )
     st.header("Paramètres d'analyse")
@@ -3152,5 +3387,7 @@ elif navigation == "⭐ Watchlist":
     render_watchlist(selected_mode)
 elif navigation == "🧪 Backtest":
     render_backtest()
-else:
+elif navigation == "🧬 Timing Lab":
     render_timing_lab()
+else:
+    render_walk_forward_validation()
