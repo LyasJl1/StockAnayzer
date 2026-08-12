@@ -12,6 +12,7 @@ NAMES = {"valid_number", "calculate_alpha", "format_alpha", "split_validation_un
          "build_out_of_sample_interpretation", "build_horizon_stability",
          "build_v3_oos_interpretation", "aggregate_v3_confirmations",
          "aggregate_unconfirmed_v3_alpha"}
+         "build_v3_oos_interpretation", "aggregate_v3_confirmations"}
 tree = ast.parse(Path("app.py").read_text(encoding="utf-8"))
 nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in NAMES]
 namespace = {"pd": pd, "Any": Any, "isfinite": isfinite, "BACKTEST_HORIZONS": (5, 20, 60)}

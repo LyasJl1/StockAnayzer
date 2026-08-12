@@ -1683,6 +1683,7 @@ def _render_out_of_sample_results(result: dict[str, Any]) -> None:
             unconfirmed_row["Alpha moyen 20j"] = format_alpha(unconfirmed_alpha["alpha_mean"])
             unconfirmed_row["Alpha médian 20j"] = format_alpha(unconfirmed_alpha["alpha_median"])
             unconfirmed_row["Actions disponibles"] = unconfirmed_alpha["assets"]
+            unconfirmed_row["Alpha 20j"] = format_alpha(calculate_alpha(mean, by_engine["V3 Early"][20]["baseline_mean"]))
     st.dataframe(pd.DataFrame([unconfirmed_row]), use_container_width=True, hide_index=True)
 
     st.markdown("#### Synthèse complète")
