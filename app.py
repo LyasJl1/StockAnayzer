@@ -960,6 +960,113 @@ def sample_size_warning(n: int) -> str | None:
     return None
 
 
+def calculate_alpha(signal_return: Any, baseline_return: Any) -> float | None:
+    """Retourne l'écart absolu signal-baseline (exprimé ensuite en points)."""
+    if not valid_number(signal_return) or not valid_number(baseline_return):
+        return None
+    return float(signal_return) - float(baseline_return)
+
+
+def format_alpha(value: Any) -> str:
+    """Formate un rendement décimal en points de pourcentage, jamais en ratio relatif."""
+    return f"{float(value) * 100:+.1f} pt" if valid_number(value) else "N/D"
+
+
+def split_validation_universes(conception: list[str], validation: list[str],
+                               limit: int = 20) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Déduplique les univers et retire systématiquement leur chevauchement."""
+    designed = tuple(dict.fromkeys(symbol.upper() for symbol in conception if symbol))
+    candidates = tuple(dict.fromkeys(symbol.upper() for symbol in validation if symbol))[:limit]
+    designed_set = set(designed)
+    return tuple(symbol for symbol in candidates if symbol not in designed_set), \
+        tuple(symbol for symbol in candidates if symbol in designed_set)
+
+
+def aggregate_out_of_sample(raw_stats: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Agrège sans imputation : une action pèse une fois, sauf l'alpha pondéré."""
+    rows: list[dict[str, Any]] = []
+    for horizon in BACKTEST_HORIZONS:
+        for engine in ("V1", "V2"):
+            available, baselines = [], []
+            for item in raw_stats:
+                stats, baseline = item[engine][horizon], item["baseline"][horizon]
+                alpha = calculate_alpha(stats["mean"], baseline["mean"])
+                if valid_number(alpha):
+                    available.append((float(stats["mean"]), float(alpha), stats["observations"],
+                                      stats.get("drawdown_mean"), stats.get("drawdown_median"),
+                                      stats.get("drawdown_worst")))
+                    baselines.append(float(baseline["mean"]))
+            alphas = [x[1] for x in available]
+            observations = sum(x[2] for x in available)
+            drawdowns = [float(x[3]) for x in available if valid_number(x[3])]
+            med_drawdowns = [float(x[4]) for x in available if valid_number(x[4])]
+            worst_drawdowns = [float(x[5]) for x in available if valid_number(x[5])]
+            positive = sum(alpha > 0 for alpha in alphas)
+            rows.append({
+                "engine": engine, "horizon": horizon, "assets": len(alphas),
+                "performance_mean": pd.Series([x[0] for x in available]).mean() if available else None,
+                "performance_median": pd.Series([x[0] for x in available]).median() if available else None,
+                "baseline_mean": pd.Series(baselines).mean() if baselines else None,
+                "alpha_mean": pd.Series(alphas).mean() if alphas else None,
+                "alpha_median": pd.Series(alphas).median() if alphas else None,
+                "alpha_weighted": (sum(x[1] * x[2] for x in available) / observations
+                                   if observations else None),
+                "positive_assets": positive, "nonpositive_assets": len(alphas) - positive,
+                "positive_ratio": positive / len(alphas) if alphas else None,
+                "observations": observations,
+                "drawdown_mean": pd.Series(drawdowns).mean() if drawdowns else None,
+                "drawdown_median": pd.Series(med_drawdowns).median() if med_drawdowns else None,
+                "drawdown_worst": min(worst_drawdowns) if worst_drawdowns else None,
+            })
+    return rows
+
+
+def out_of_sample_robustness(summary_20: dict[str, Any], summary_60: dict[str, Any],
+                             baseline_drawdown: Any = None) -> str:
+    """Classement prudent et entièrement déterministe de la robustesse historique."""
+    mean, median, ratio = (summary_20.get("alpha_mean"), summary_20.get("alpha_median"),
+                           summary_20.get("positive_ratio"))
+    if not all(valid_number(x) for x in (mean, median, ratio)):
+        return "Faible"
+    if (mean <= 0 and median <= 0) or ratio < .4:
+        return "Faible"
+    signals_ok = summary_20.get("observations", 0) >= 30
+    dd = summary_20.get("drawdown_mean")
+    dd_ok = not (valid_number(dd) and valid_number(baseline_drawdown) and dd < baseline_drawdown - .03)
+    sixty_ok = not (valid_number(summary_60.get("alpha_mean")) and summary_60["alpha_mean"] < -.03)
+    return "Encourageante" if mean > 0 and median > 0 and ratio > .5 and signals_ok and dd_ok and sixty_ok else "Mitigée"
+
+
+def build_out_of_sample_interpretation(engine: str, summary_20: dict[str, Any],
+                                       robustness: str) -> str:
+    """Produit une lecture historique déterministe, sans prétention prédictive."""
+    mean, median = summary_20.get("alpha_mean"), summary_20.get("alpha_median")
+    positive, assets = summary_20.get("positive_assets", 0), summary_20.get("assets", 0)
+    if robustness == "Faible":
+        return (f"{engine} ne montre pas d'avantage robuste hors échantillon : l'alpha moyen à 20 séances "
+                f"est {format_alpha(mean)} et {positive} actions sur {assets} battent leur baseline. "
+                "Ce constat est historique et ne constitue pas une prédiction.")
+    if robustness == "Encourageante":
+        return (f"{engine} montre un avantage historique encourageant hors échantillon sur cet univers : "
+                f"alpha moyen {format_alpha(mean)}, alpha médian {format_alpha(median)}, et baseline battue "
+                f"sur {positive} actions sur {assets}. Une validation sur d'autres périodes reste nécessaire.")
+    return (f"Les résultats hors échantillon de {engine} sont mitigés : alpha moyen {format_alpha(mean)}, "
+            f"alpha médian {format_alpha(median)}, et {positive} actions sur {assets} au-dessus de leur baseline. "
+            "Ils doivent être confirmés sur d'autres périodes.")
+
+
+def build_horizon_stability(engine: str, summaries: dict[int, dict[str, Any]]) -> str:
+    values = {h: summaries[h].get("alpha_mean") for h in BACKTEST_HORIZONS}
+    detail = ", ".join(f"{h}j {format_alpha(values[h])}" for h in BACKTEST_HORIZONS)
+    if valid_number(values[20]) and values[20] > 0 and valid_number(values[60]) and values[60] <= 0:
+        conclusion = f"L'avantage {engine} apparaît principalement à moyen terme et ne se maintient pas à 60 séances."
+    elif all(valid_number(values[h]) and values[h] > 0 for h in BACKTEST_HORIZONS):
+        conclusion = f"L'alpha historique de {engine} reste positif sur les trois horizons étudiés."
+    else:
+        conclusion = f"L'alpha historique de {engine} varie selon l'horizon."
+    return f"{detail}. {conclusion} Il ne s'agit pas d'une prédiction."
+
+
 def build_backtest_interpretation(high: dict[str, Any], baseline: dict[str, Any],
                                   low: dict[str, Any], threshold: int) -> str:
     """Lecture déterministe de l'horizon 20, favorable ou défavorable sans sélection."""
@@ -1063,6 +1170,172 @@ def _lab_table(stats1: dict[str, Any], stats2: dict[str, Any],
                      "V1 drawdown": format_percentage(a["drawdown_mean"]),
                      "V2 drawdown": format_percentage(b["drawdown_mean"])})
     return pd.DataFrame(rows)
+
+
+def _calculate_validation_assets(tickers: tuple[str, ...], histories: dict[str, pd.DataFrame],
+                                 threshold1: float, threshold2: float) -> tuple[list[dict[str, Any]], list[str]]:
+    """Applique strictement les moteurs et la baseline existants à chaque actif valide."""
+    results, ignored = [], []
+    for symbol in tickers:
+        history = histories.get(symbol, pd.DataFrame())
+        if len(history) < 220:
+            ignored.append(symbol)
+            continue
+        v1, v2 = _lab_eligible(history)
+        if v1.empty or v2.empty:
+            ignored.append(symbol)
+            continue
+        s1, stats1 = _lab_variant(v1, threshold1, v1)
+        s2, stats2 = _lab_variant(v2, threshold2, v2)
+        baseline_rows = calculate_signal_drawdowns(calculate_forward_returns(v1, v1), v1)
+        baseline = calculate_backtest_statistics(baseline_rows)
+        results.append({"ticker": symbol, "V1": stats1, "V2": stats2,
+                        "baseline": baseline, "signals_V1": len(s1), "signals_V2": len(s2)})
+    return results, ignored
+
+
+def _validation_export(raw_stats: list[dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for item in raw_stats:
+        row = {"Ticker": item["ticker"], "V1 signals": item["signals_V1"],
+               "V2 signals": item["signals_V2"]}
+        for horizon in BACKTEST_HORIZONS:
+            baseline = item["baseline"][horizon]["mean"]
+            row[f"baseline {horizon}"] = baseline
+            for engine in ("V1", "V2"):
+                stats = item[engine][horizon]
+                row[f"{engine} perf {horizon}"] = stats["mean"]
+                row[f"{engine} alpha {horizon}"] = calculate_alpha(stats["mean"], baseline)
+                row[f"{engine} drawdown mean {horizon}"] = stats["drawdown_mean"]
+                row[f"{engine} drawdown median {horizon}"] = stats["drawdown_median"]
+                row[f"{engine} drawdown worst {horizon}"] = stats["drawdown_worst"]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _render_out_of_sample_results(result: dict[str, Any]) -> None:
+    raw_stats, conception_stats = result["validation"], result["conception"]
+    ignored = result["ignored"]
+    if ignored:
+        st.warning(f"{len(ignored)} ticker(s) ignorés faute de données suffisantes : {', '.join(ignored)}.")
+    if not raw_stats:
+        st.error("Aucun historique hors échantillon exploitable.")
+        return
+    valid_assets = len(raw_stats)
+    if valid_assets < 5:
+        st.warning("⚠️ Univers de validation trop petit pour tirer une conclusion robuste.")
+    elif valid_assets < 10:
+        st.warning("🟠 Univers de validation limité.")
+    summaries = aggregate_out_of_sample(raw_stats)
+    by_engine = {engine: {row["horizon"]: row for row in summaries if row["engine"] == engine}
+                 for engine in ("V1", "V2")}
+
+    st.markdown("### 📊 Validation hors échantillon — 20 séances")
+    cols = st.columns(2)
+    baseline_dd = pd.Series([item["baseline"][20]["drawdown_mean"] for item in raw_stats
+                             if valid_number(item["baseline"][20]["drawdown_mean"])]).mean()
+    robustness = {}
+    for column, engine in zip(cols, ("V1", "V2")):
+        summary = by_engine[engine][20]
+        robustness[engine] = out_of_sample_robustness(summary, by_engine[engine][60], baseline_dd)
+        column.markdown(f"#### {engine}")
+        column.write(f"Performance moyenne : **{format_percentage(summary['performance_mean'])}**  \n"
+                     f"Performance médiane : **{format_percentage(summary['performance_median'])}**  \n"
+                     f"Baseline : **{format_percentage(summary['baseline_mean'])}**  \n"
+                     f"Alpha moyen : **{format_alpha(summary['alpha_mean'])}**  \n"
+                     f"Alpha médian : **{format_alpha(summary['alpha_median'])}**  \n"
+                     f"Alpha pondéré par observations : **{format_alpha(summary['alpha_weighted'])}**  \n"
+                     f"Actions alpha positif : **{summary['positive_assets']} / {summary['assets']} "
+                     f"({summary['positive_ratio']:.0%})**  \n"
+                     f"Actions alpha ≤ 0 : **{summary['nonpositive_assets']} / {summary['assets']}**  \n"
+                     f"Signaux : **{summary['observations']}**  \n"
+                     f"Robustesse hors échantillon : **{robustness[engine]}**")
+        column.write(build_out_of_sample_interpretation(engine, summary, robustness[engine]))
+        if warning := sample_size_warning(summary["observations"]):
+            column.warning(warning)
+
+    table20 = []
+    for item in raw_stats:
+        base = item["baseline"][20]["mean"]
+        table20.append({"Ticker": item["ticker"], "V1 20j": format_percentage(item["V1"][20]["mean"]),
+                        "Alpha V1": format_alpha(calculate_alpha(item["V1"][20]["mean"], base)),
+                        "V2 20j": format_percentage(item["V2"][20]["mean"]),
+                        "Alpha V2": format_alpha(calculate_alpha(item["V2"][20]["mean"], base)),
+                        "Baseline 20j": format_percentage(base), "Signaux V1": item["signals_V1"],
+                        "Signaux V2": item["signals_V2"]})
+    st.dataframe(pd.DataFrame(table20), use_container_width=True, hide_index=True)
+
+    with st.expander("Résultats détaillés — 5 et 60 séances"):
+        detail = []
+        for item in raw_stats:
+            row = {"Ticker": item["ticker"]}
+            for horizon in (5, 60):
+                base = item["baseline"][horizon]["mean"]
+                row[f"Baseline {horizon}j"] = format_percentage(base)
+                for engine in ("V1", "V2"):
+                    row[f"{engine} {horizon}j"] = format_percentage(item[engine][horizon]["mean"])
+                    row[f"Alpha {engine} {horizon}j"] = format_alpha(calculate_alpha(item[engine][horizon]["mean"], base))
+            detail.append(row)
+        st.dataframe(pd.DataFrame(detail), use_container_width=True, hide_index=True)
+
+    st.markdown("#### Synthèse complète")
+    synthesis = [{"Moteur": row["engine"], "Horizon": f"{row['horizon']} séances",
+                  "Perf moyenne": format_percentage(row["performance_mean"]),
+                  "Perf médiane": format_percentage(row["performance_median"]),
+                  "Baseline": format_percentage(row["baseline_mean"]),
+                  "Alpha moyen": format_alpha(row["alpha_mean"]),
+                  "Alpha médian": format_alpha(row["alpha_median"]),
+                  "Alpha pondéré / observations": format_alpha(row["alpha_weighted"]),
+                  "Alpha positif": f"{row['positive_assets']} / {row['assets']} ({row['positive_ratio']:.0%})",
+                  "Alpha ≤ 0": f"{row['nonpositive_assets']} / {row['assets']}",
+                  "Drawdown moy.": format_percentage(row["drawdown_mean"]),
+                  "Drawdown médian": format_percentage(row["drawdown_median"]),
+                  "Pire drawdown": format_percentage(row["drawdown_worst"]),
+                  "Signaux": row["observations"]} for row in summaries]
+    st.dataframe(pd.DataFrame(synthesis), use_container_width=True, hide_index=True)
+
+    st.markdown("#### Stabilité par horizon et entre actions")
+    for engine in ("V1", "V2"):
+        st.write(f"**{engine}** — {build_horizon_stability(engine, by_engine[engine])}")
+        asset_alphas = [(item["ticker"], calculate_alpha(item[engine][20]["mean"], item["baseline"][20]["mean"]))
+                        for item in raw_stats]
+        asset_alphas = [(ticker, alpha) for ticker, alpha in asset_alphas if valid_number(alpha)]
+        if asset_alphas:
+            best, worst = max(asset_alphas, key=lambda x: x[1]), min(asset_alphas, key=lambda x: x[1])
+            st.caption(f"Meilleur alpha : {best[0]} {format_alpha(best[1])} — Pire alpha : "
+                       f"{worst[0]} {format_alpha(worst[1])} — écart {format_alpha(best[1] - worst[1])}.")
+
+    chart = go.Figure()
+    for engine in ("V1", "V2"):
+        chart.add_trace(go.Bar(name=engine, x=[item["ticker"] for item in raw_stats],
+                               y=[calculate_alpha(item[engine][20]["mean"], item["baseline"][20]["mean"]) * 100
+                                  if valid_number(calculate_alpha(item[engine][20]["mean"], item["baseline"][20]["mean"])) else None
+                                  for item in raw_stats]))
+    chart.add_hline(y=0, line_color="#94a3b8")
+    chart.update_layout(title="Distribution de l'alpha 20 séances par action", barmode="group",
+                        yaxis_title="Alpha (points de pourcentage)", height=380,
+                        margin=dict(l=10, r=10, t=50, b=10))
+    st.plotly_chart(chart, use_container_width=True)
+
+    st.markdown("### 🔬 Conception vs validation")
+    conception_summary = aggregate_out_of_sample(conception_stats)
+    conception_20 = {(row["engine"], row["horizon"]): row for row in conception_summary}
+    for engine in ("V1", "V2"):
+        design_alpha = conception_20.get((engine, 20), {}).get("alpha_mean")
+        validation_alpha = by_engine[engine][20]["alpha_mean"]
+        st.write(f"**{engine} Alpha moyen 20j** — Conception : {format_alpha(design_alpha)} · "
+                 f"Hors échantillon : {format_alpha(validation_alpha)}")
+        if valid_number(design_alpha) and design_alpha > 0 and (not valid_number(validation_alpha) or validation_alpha < design_alpha * .5):
+            st.warning("⚠️ L'avantage observé pendant la conception diminue fortement hors échantillon.")
+        elif valid_number(design_alpha) and valid_number(validation_alpha) and abs(validation_alpha - design_alpha) <= max(.005, abs(design_alpha) * .5):
+            st.success("✅ L'avantage observé reste relativement stable hors échantillon.")
+        else:
+            st.info("Les résultats de conception et de validation diffèrent ; aucune stabilité claire n'est établie.")
+
+    export = _validation_export(raw_stats)
+    st.download_button("⬇️ Exporter la validation hors échantillon", export.to_csv(index=False).encode("utf-8"),
+                       "timing_out_of_sample_validation.csv", "text/csv")
+    st.info("Prochaine étape méthodologique : validation temporelle / walk-forward sur une période jamais utilisée pour la conception.")
 
 
 def render_timing_lab() -> None:
@@ -1178,6 +1451,47 @@ def render_timing_lab() -> None:
                      f"V2 > baseline sur **{wins_base} / {len(comparable)}** actions.")
             if not encouraging: st.warning("La logique Repli + Reprise n'apporte pas d'amélioration claire et robuste sur cet échantillon.")
             if warning := sample_size_warning(total_v2): st.warning(warning)
+
+    st.divider(); st.subheader("🧪 Validation hors échantillon")
+    st.caption("Test séparé sur un univers non utilisé pendant la conception. Les règles, seuils, horizons, "
+               "espacement des signaux et cours ajustés restent strictement identiques pour tous les actifs.")
+    conception_text = st.text_area("Univers de conception", "AAPL\nMSFT\nGOOGL\nNVDA\nJPM\nXOM\nKO\nSPY",
+                                   key="lab_oos_conception", help="Ces actifs sont toujours exclus du test hors échantillon.")
+    validation_text = st.text_area("Univers de validation hors échantillon (20 maximum)",
+                                   "META\nAMZN\nAVGO\nWMT\nJNJ\nPG\nCVX\nBAC\nCAT\nHD\nDIS\nPEP",
+                                   key="lab_oos_validation")
+    conception = parse_custom_tickers(conception_text, limit=50)
+    validation = parse_custom_tickers(validation_text, limit=20)
+    effective, overlap = split_validation_universes(conception, validation)
+    info1, info2, info3 = st.columns(3)
+    info1.metric("Univers de conception", f"{len(conception)} actions")
+    info2.metric("Univers de validation", f"{len(effective)} actions")
+    info3.metric("Chevauchement", len(overlap))
+    if overlap:
+        st.warning(f"{len(overlap)} ticker(s) exclus car déjà présents dans l'univers de conception. "
+                   f"Actifs exclus : {', '.join(overlap)}.")
+    oc1, oc2, oc3 = st.columns(3)
+    oos_period_label = oc1.selectbox("Période figée", list(periods), index=2, key="lab_oos_period")
+    oos_v1 = oc2.slider("Seuil V1 figé", 40, 90, 70, key="lab_oos_v1")
+    oos_v2 = oc3.slider("Seuil V2 figé", 40, 90, 70, key="lab_oos_v2")
+    st.caption(f"Espacement minimum inchangé : {MIN_SIGNAL_GAP} séances · Horizons : 5 / 20 / 60 séances · "
+               "Aucun ajustement automatique par ticker.")
+    signature = (effective, periods[oos_period_label], oos_v1, oos_v2)
+    if st.button("🧪 Lancer la validation hors échantillon", type="primary", disabled=not effective):
+        with st.spinner("Validation causale groupée en cours…"):
+            all_tickers = tuple(dict.fromkeys((*conception, *effective)))
+            histories = load_timing_lab_histories(all_tickers, periods[oos_period_label])
+            validation_stats, ignored = _calculate_validation_assets(effective, histories, oos_v1, oos_v2)
+            conception_stats, _ = _calculate_validation_assets(tuple(conception), histories, oos_v1, oos_v2)
+            st.session_state["timing_oos_result"] = {
+                "signature": signature, "validation": validation_stats, "conception": conception_stats,
+                "ignored": ignored,
+            }
+    stored = st.session_state.get("timing_oos_result")
+    if stored and stored.get("signature") == signature:
+        _render_out_of_sample_results(stored)
+    elif stored:
+        st.info("Les paramètres ont changé. Relancez la validation pour obtenir des résultats comparables.")
     st.warning("Les règles V2 ont été définies avant observation de ce test. Ne modifiez pas immédiatement les seuils après chaque résultat : cela créerait un risque de sur-optimisation.")
     st.info("Une future étape consistera à figer la meilleure variante puis à la tester sur une période / un univers non utilisé lors de sa conception.")
 
