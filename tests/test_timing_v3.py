@@ -65,6 +65,19 @@ def test_future_mutation_does_not_change_v3_at_t():
             after["trigger"]["status"], after["metrics"]["v3_signal_strength"])
 
 
+def test_vectorized_series_matches_point_in_time_reference_strictly():
+    """La voie vectorielle conserve exactement les états du calcul de référence."""
+    data = scenario()
+    series = calculate_v3_timing_series(data)
+    for position in (20, 100, 200, 259):
+        reference = calculate_rigorous_entry_v3(data.iloc[:position + 1])
+        row = series.iloc[position]
+        assert row["regime_status"] == reference["regime"]["status"]
+        assert row["setup_status"] == reference["setup"]["status"]
+        assert row["trigger_status"] == reference["trigger"]["status"]
+        assert abs(row["v3_signal_strength"] - reference["metrics"]["v3_signal_strength"]) <= 1e-10
+
+
 def test_unconfirmed_early_is_marked_after_fifteen_sessions():
     timeline = pd.DataFrame({"close": [100.0] * 30, "_position": range(30)})
     early = timeline.iloc[[2]].copy()
