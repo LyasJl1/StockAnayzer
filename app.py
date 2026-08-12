@@ -501,6 +501,22 @@ def calculate_atr(data: pd.DataFrame, period: int = 14) -> pd.Series:
     return atr.where(atr > 0)
 
 
+def prepare_historical_features(data: pd.DataFrame) -> pd.DataFrame:
+    """Calcule une fois le socle causal commun aux moteurs historiques."""
+    if data.empty or "Close" not in data:
+        return pd.DataFrame(index=data.index)
+    frame = calculate_indicators(data)
+    close = frame["Close"]
+    frame["ATR14"] = calculate_atr(frame)
+    frame["distance_mm50"] = close.div(frame["MM50"]).sub(1).where(frame["MM50"].ne(0))
+    frame["distance_mm200"] = close.div(frame["MM200"]).sub(1).where(frame["MM200"].ne(0))
+    frame["high_20"] = close.rolling(20).max()
+    frame["mm50_slope_10"] = frame["MM50"] - frame["MM50"].shift(10)
+    frame["mm200_slope_20"] = frame["MM200"] - frame["MM200"].shift(20)
+    frame["volatility_252"] = close.pct_change().expanding(min_periods=2).std() * sqrt(252)
+    return frame
+
+
 def calculate_price_zones(data: pd.DataFrame, atr: float | None) -> dict[str, Any]:
     """Repère les pivots proches sur 60 séances, sans extrapoler de niveau."""
     result: dict[str, Any] = {"support": None, "resistance": None,
@@ -718,43 +734,56 @@ def load_backtest_history(ticker: str, period: str) -> pd.DataFrame:
 
 
 def calculate_historical_timing_series(data: pd.DataFrame, mode: str) -> pd.DataFrame:
-    """Rejoue causalement le barème Timing technique, sans événements ni fondamentaux."""
+    """Rejoue causalement le barème Timing technique, de façon vectorielle."""
+    del mode
     if data.empty:
         return pd.DataFrame()
-    indicators = calculate_indicators(data)
-    indicators["ATR14"] = calculate_atr(indicators)
-    rows: list[dict[str, Any]] = []
-    # Chaque tranche s'arrête à la séance notée : les calculs rolling/EWM et les
-    # zones ne peuvent donc observer aucune valeur future. Le barème reste celui
-    # de calculate_entry_timing, et Événements est retiré du dénominateur.
-    for position in range(len(indicators)):
-        prefix = indicators.iloc[:position + 1]
-        timing = calculate_entry_timing(prefix, {}, {}, mode)
-        criteria = [item for item in timing["criteria"]
-                    if item["category"] != "Événements" and item["available"]]
-        available = sum(item["max"] for item in criteria)
-        earned = sum(item["earned"] for item in criteria)
-        categories: dict[str, float | None] = {}
-        for category in ("Tendance", "Momentum", "Zone de prix", "Risque"):
-            selected = [item for item in criteria if item["category"] == category]
-            maximum = sum(item["max"] for item in selected)
-            categories[category] = sum(item["earned"] for item in selected) / maximum * 100 if maximum else None
-        row = indicators.iloc[position]
-        close, mm50, mm200 = row.get("Close"), row.get("MM50"), row.get("MM200")
-        rows.append({
-            "date": indicators.index[position], "close": close,
-            "timing_score": earned / available * 100 if available else None,
-            "timing_confidence": available,
-            "tendance_score": categories["Tendance"],
-            "momentum_score": categories["Momentum"], "zone_score": categories["Zone de prix"],
-            "risque_score": categories["Risque"], "RSI": row.get("RSI"),
-            "MACD": row.get("MACD"), "Signal MACD": row.get("Signal"),
-            "MM50": mm50, "MM200": mm200, "ATR14": row.get("ATR14"),
-            "distance_mm50": close / mm50 - 1 if valid_number(close) and valid_number(mm50) and mm50 else None,
-            "distance_mm200": close / mm200 - 1 if valid_number(close) and valid_number(mm200) and mm200 else None,
-            "_position": position,
-        })
-    return pd.DataFrame(rows).set_index("date", drop=False)
+    f = data
+    if not {"MM50", "MM200", "RSI", "MACD", "Signal", "ATR14", "volatility_252"}.issubset(f.columns):
+        f = calculate_indicators(data)
+        f["ATR14"] = calculate_atr(f)
+        f["volatility_252"] = f["Close"].pct_change().expanding(min_periods=2).std() * (252 ** .5)
+    close, mm50, mm200, rsi = f["Close"], f["MM50"], f["MM200"], f["RSI"]
+    macd, signal, atr = f["MACD"], f["Signal"], f["ATR14"]
+    components: dict[str, list[tuple[pd.Series, pd.Series, float]]] = {k: [] for k in ("tendance", "momentum", "zone", "risque")}
+    def add(cat: str, points: pd.Series, available: pd.Series, maximum: float) -> None:
+        components[cat].append((points.where(available), available, maximum))
+    add("tendance", (close > mm200).astype(float)*10, close.notna() & mm200.notna(), 10)
+    add("tendance", (close > mm50).astype(float)*8, close.notna() & mm50.notna(), 8)
+    add("tendance", (mm50 > mm200).astype(float)*8, mm50.notna() & mm200.notna(), 8)
+    add("tendance", (mm50 > mm50.shift(10)).astype(float)*4, mm50.notna() & mm50.shift(10).notna(), 4)
+    rp = pd.Series(4.0, index=f.index).mask(rsi > 70, 2).mask((rsi > 30) & (rsi < 40), 3).mask((rsi >= 40) & (rsi < 45), 6).mask((rsi > 60) & (rsi <= 70), 7).mask(rsi.between(45, 60), 10)
+    add("momentum", rp, rsi.notna(), 10)
+    gap = macd-signal
+    add("momentum", (macd > signal).astype(float)*10, macd.notna() & signal.notna(), 10)
+    add("momentum", (gap > gap.shift(5)).astype(float)*5, gap.notna() & gap.shift(5).notna(), 5)
+    distance = close.div(mm50).sub(1).where(mm50.ne(0))
+    dp = pd.Series(2.0, index=f.index).mask((distance > .10) & (distance <= .15), 4).mask((distance >= -.05) & (distance < -.02), 5).mask((distance > .05) & (distance <= .10), 7).mask(distance.between(-.02,.05),10)
+    add("zone", dp, distance.notna(), 10)
+    high = f["High"].rolling(252, min_periods=1).max() if "High" in f else pd.Series(index=f.index, dtype=float)
+    low = f["Low"].rolling(252, min_periods=1).min() if "Low" in f else pd.Series(index=f.index, dtype=float)
+    position = close.sub(low).div(high-low).where(high.gt(low))
+    pp = pd.Series(1.0,index=f.index).mask(position < .20,2).mask((position > .80)&(position <= .92),3).mask((position >= .20)&(position < .35),4).mask(position.between(.35,.80),5)
+    add("zone", pp, position.notna(), 5)
+    extension = close.sub(mm50).abs().div(atr).where(atr.gt(0))
+    ep = pd.Series(0.0,index=f.index).mask(extension <= 3,2).mask(extension <= 2,4).mask(extension <= 1,5)
+    add("zone", ep, extension.notna(), 5)
+    vol = f["volatility_252"]
+    vp = pd.Series(1.0,index=f.index).mask(vol <= .55,3).mask(vol <= .40,6).mask(vol <= .30,8).mask(vol < .20,10)
+    add("risque", vp, vol.notna(), 10)
+    atrp = atr.div(close).where(close.gt(0))
+    ap = pd.Series(0.0,index=f.index).mask(atrp <= .06,1).mask(atrp <= .045,3).mask(atrp <= .03,4).mask(atrp < .02,5)
+    add("risque", ap, atrp.notna(), 5)
+    scores, maxima = {}, {}
+    for cat, items in components.items():
+        earned = sum((p.fillna(0) for p,_,_ in items), pd.Series(0.0,index=f.index))
+        maximum = sum((a.astype(float)*m for _,a,m in items), pd.Series(0.0,index=f.index))
+        scores[cat] = earned.div(maximum.where(maximum.gt(0))).mul(100); maxima[cat]=(earned,maximum)
+    earned = sum((x[0] for x in maxima.values()), pd.Series(0.0,index=f.index)); available=sum((x[1] for x in maxima.values()),pd.Series(0.0,index=f.index))
+    return pd.DataFrame({"date":f.index,"close":close,"timing_score":earned.div(available.where(available.gt(0))).mul(100),"timing_confidence":available,
+        "tendance_score":scores["tendance"],"momentum_score":scores["momentum"],"zone_score":scores["zone"],"risque_score":scores["risque"],
+        "RSI":rsi,"MACD":macd,"Signal MACD":signal,"MM50":mm50,"MM200":mm200,"ATR14":atr,"distance_mm50":distance,
+        "distance_mm200":close.div(mm200).sub(1).where(mm200.ne(0)),"_position":range(len(f))},index=f.index)
 
 
 def extract_backtest_signals(timing: pd.DataFrame, threshold: float,
@@ -781,15 +810,11 @@ def calculate_forward_returns(observations: pd.DataFrame, timeline: pd.DataFrame
     """Calcule Close[T+h]/Close[T]-1 ; un horizon incomplet reste NaN."""
     result = observations.copy()
     closes = timeline["close"].reset_index(drop=True)
+    positions = result["_position"].astype(int).to_numpy()
     for horizon in BACKTEST_HORIZONS:
-        values: list[float | None] = []
-        for position in result["_position"].astype(int):
-            if position + horizon < len(closes) and valid_number(closes.iloc[position]):
-                future = closes.iloc[position + horizon]
-                values.append(float(future) / float(closes.iloc[position]) - 1 if valid_number(future) else None)
-            else:
-                values.append(None)
-        result[f"return_{horizon}"] = values
+        future = closes.shift(-horizon)
+        values = future.div(closes).sub(1)
+        result[f"return_{horizon}"] = values.reindex(positions).to_numpy()
     return result
 
 
@@ -797,17 +822,16 @@ def calculate_signal_drawdowns(signals: pd.DataFrame, timeline: pd.DataFrame) ->
     """Ajoute le drawdown et la MFE observés de T à T+h inclus."""
     result = signals.copy()
     closes = timeline["close"].reset_index(drop=True)
+    positions = result["_position"].astype(int).to_numpy()
     for horizon in BACKTEST_HORIZONS:
-        drawdowns, mfes = [], []
-        for position in result["_position"].astype(int):
-            if position + horizon >= len(closes) or not valid_number(closes.iloc[position]):
-                drawdowns.append(None); mfes.append(None); continue
-            window = closes.iloc[position:position + horizon + 1].dropna()
-            reference = float(closes.iloc[position])
-            drawdowns.append(float(window.min()) / reference - 1 if not window.empty else None)
-            mfes.append(float(window.max()) / reference - 1 if not window.empty else None)
-        result[f"drawdown_{horizon}"] = drawdowns
-        result[f"mfe_{horizon}"] = mfes
+        # Un rolling renversé donne exactement min/max de [T, T+h].
+        future_min = closes.iloc[::-1].rolling(horizon + 1, min_periods=1).min().iloc[::-1]
+        future_max = closes.iloc[::-1].rolling(horizon + 1, min_periods=1).max().iloc[::-1]
+        complete = pd.Series(range(len(closes)), index=closes.index).add(horizon).lt(len(closes))
+        dd = future_min.div(closes).sub(1).where(complete)
+        mfe = future_max.div(closes).sub(1).where(complete)
+        result[f"drawdown_{horizon}"] = dd.reindex(positions).to_numpy()
+        result[f"mfe_{horizon}"] = mfe.reindex(positions).to_numpy()
     return result
 
 
@@ -845,8 +869,10 @@ def calculate_pullback_timing_series(data: pd.DataFrame) -> pd.DataFrame:
     """
     if data.empty or "Close" not in data:
         return pd.DataFrame()
-    frame = calculate_indicators(data)
-    frame["ATR14"] = calculate_atr(frame)
+    frame = data
+    if not {"MM50", "MM200", "RSI", "MACD", "Signal", "ATR14"}.issubset(frame.columns):
+        frame = calculate_indicators(data)
+        frame["ATR14"] = calculate_atr(frame)
     close, mm50, mm200 = frame["Close"], frame["MM50"], frame["MM200"]
     rsi, macd, signal, atr = frame["RSI"], frame["MACD"], frame["Signal"], frame["ATR14"]
     distance = close.div(mm50).sub(1).where(mm50.ne(0))
@@ -1099,16 +1125,39 @@ def calculate_rigorous_entry_v3(data: pd.DataFrame) -> dict[str, Any]:
 
 
 def calculate_v3_timing_series(data: pd.DataFrame) -> pd.DataFrame:
-    """Construit les états V3 causaux et les événements Early / Confirmed."""
+    """Construit en colonnes les états V3 causaux et événements Early / Confirmed."""
     frame = _v3_prepared(data)
-    rows = []
-    for position in range(len(frame)):
-        result = calculate_rigorous_entry_v3(frame.iloc[:position + 1])
-        rows.append({"date": frame.index[position], "close": frame["Close"].iloc[position],
-                     "regime_status": result["regime"]["status"], "setup_status": result["setup"]["status"],
-                     "trigger_status": result["trigger"]["status"],
-                     "v3_signal_strength": result["metrics"]["v3_signal_strength"], "_position": position})
-    series = pd.DataFrame(rows, index=frame.index)
+    if frame.empty:
+        return pd.DataFrame()
+    close, mm50, mm200 = frame["Close"], frame["MM50"], frame["MM200"]
+    rsi, macd, signal, atr = frame["RSI"], frame["MACD"], frame["Signal"], frame["ATR14"]
+    core_available = pd.concat([close.notna() & mm200.notna(), mm50.notna() & mm200.notna(), mm200.notna() & mm200.shift(20).notna()], axis=1)
+    core_passed = pd.concat([close > mm200, mm50 > mm200, mm200 > mm200.shift(20)], axis=1) & core_available
+    count = core_available.sum(axis=1); ratio = core_passed.sum(axis=1).div(count.where(count.gt(0)))
+    regime_status = pd.Series("Défavorable", index=frame.index).mask(ratio >= 2/3, "Mitigé").mask(ratio >= 1, "Favorable").mask(count.eq(0), "N/D")
+    distance = close.div(mm50).sub(1).where(mm50.ne(0)); distance200 = close.div(mm200).sub(1).where(mm200.ne(0))
+    extended = distance200.gt(.35) | distance.gt(.20)
+    atr_distance = close.sub(mm50).abs().div(atr).where(atr.gt(0))
+    setup_available = pd.concat([distance.notna(), rsi.notna(), atr_distance.notna()],axis=1)
+    setup_passed = pd.concat([distance.between(-.05,.03), rsi.between(35,52), atr_distance.le(2)],axis=1) & setup_available
+    context = regime_status.isin(["Favorable","Mitigé"])
+    present = context & distance.between(-.05,.03) & rsi.between(35,52) & ~extended
+    possible = context & setup_passed.sum(axis=1).ge(2) & ~extended
+    setup_status = pd.Series("Absent",index=frame.index).mask(possible,"Possible").mask(present,"Présent").mask(setup_available.sum(axis=1).eq(0),"N/D")
+    gap=macd-signal
+    prior_available = pd.concat([(close.shift(i).notna() & mm50.shift(i).notna()) for i in range(1,6)],axis=1).any(axis=1)
+    prior_below = pd.concat([(close.shift(i) < mm50.shift(i)) for i in range(1,6)],axis=1).any(axis=1)
+    trigger_available = pd.concat([close.notna()&close.shift(3).notna()&close.shift(1).notna(), rsi.notna()&rsi.shift(3).notna(), gap.notna()&gap.shift(3).notna()&gap.shift(5).notna(), macd.notna()&signal.notna(), close.notna()&mm50.notna()&prior_available],axis=1)
+    trigger_passed = pd.concat([(close>close.shift(3))&(close>close.shift(1)),(rsi>rsi.shift(3))&(rsi>=42),(gap>gap.shift(3))&(gap>gap.shift(5)),macd>signal,(close>mm50)&prior_below],axis=1) & trigger_available
+    passed=trigger_passed.sum(axis=1); trigger_status=pd.Series("Absent",index=frame.index).mask(passed.ge(1),"Partiel").mask(passed.ge(3),"Fort").mask(trigger_available.sum(axis=1).eq(0),"N/D")
+    regime_score = core_passed.mul([15,15,10],axis=1).sum(axis=1)
+    distance_points = pd.Series(0.0,index=frame.index).mask((distance>=-.08)&(distance<-.05),9).mask(distance.between(-.05,.03),15).mask((distance>.03)&(distance<=.08),6)
+    rsi_points = pd.Series(0.0,index=frame.index).mask(rsi.between(32,55),6).mask(rsi.between(38,50),10)
+    atr_points = pd.Series(0.0,index=frame.index).mask(atr_distance<=2,3).mask(atr_distance<=1,5)
+    trigger_score=trigger_passed.mul([7,6,7,5,5],axis=1).sum(axis=1)
+    strength=regime_score+distance_points+rsi_points+atr_points+trigger_score
+    strength=strength.where(regime_status.ne("Défavorable"),strength.clip(upper=55))
+    series=pd.DataFrame({"date":frame.index,"close":close,"regime_status":regime_status,"setup_status":setup_status,"trigger_status":trigger_status,"v3_signal_strength":strength.astype(float),"_position":range(len(frame))},index=frame.index)
     eligible = (series["regime_status"] == "Favorable") & (series["setup_status"] == "Présent")
     early_state = eligible & (series["trigger_status"] == "Partiel")
     confirmed_state = eligible & (series["trigger_status"] == "Fort")
@@ -1264,15 +1313,21 @@ def _bounded_window_statistics(observations: pd.DataFrame, timeline: pd.DataFram
 def calculate_walk_forward(history: pd.DataFrame, ticker: str, windows: list[dict[str, Any]],
                            engines: tuple[str, ...]) -> list[dict[str, Any]]:
     """Pré-calcule chaque moteur une fois, puis découpe uniquement les validations futures."""
-    v1 = calculate_historical_timing_series(history, "Investisseur")
-    v2 = calculate_pullback_timing_series(history).reindex(v1.index)
-    v3 = calculate_v3_timing_series(history).reindex(v1.index)
+    features = prepare_historical_features(history)
+    v1 = calculate_historical_timing_series(features, "Investisseur")
     # Extraction sur la série complète : dates et espacement sont identiques au Timing Lab normal.
-    signals = {
-        "V1": extract_threshold_signals(v1, 70), "V2": extract_threshold_signals(v2, 70),
-        "V3 Early": extract_v3_signals(v3, "early"),
-        "V3 Confirmed": extract_v3_signals(v3, "confirmed"),
-    }
+    signals: dict[str, pd.DataFrame] = {}
+    if "V1" in engines:
+        signals["V1"] = extract_threshold_signals(v1, 70)
+    if "V2" in engines:
+        v2 = calculate_pullback_timing_series(features).reindex(v1.index)
+        signals["V2"] = extract_threshold_signals(v2, 70)
+    if {"V3 Early", "V3 Confirmed"}.intersection(engines):
+        v3 = calculate_v3_timing_series(features).reindex(v1.index)
+        if "V3 Early" in engines:
+            signals["V3 Early"] = extract_v3_signals(v3, "early")
+        if "V3 Confirmed" in engines:
+            signals["V3 Confirmed"] = extract_v3_signals(v3, "confirmed")
     rows = []
     for window in windows:
         baseline = _bounded_window_statistics(v1, v1, window["validation_start"], window["validation_end"])
