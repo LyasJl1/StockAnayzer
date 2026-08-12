@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from html import escape
 from math import isfinite, sqrt
 from typing import Any
@@ -27,6 +27,8 @@ CURRENCY_SYMBOLS = {
     "USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥", "CHF": "CHF ",
     "CAD": "C$", "CNY": "¥", "INR": "₹", "KRW": "₩",
 }
+BACKTEST_HORIZONS = (5, 20, 60)
+MIN_SIGNAL_GAP = 10
 
 
 st.set_page_config(
@@ -690,6 +692,295 @@ def calculate_entry_timing(data: pd.DataFrame, info: dict[str, Any],
             "distance_mm50": distance, "extension_atr": extension,
             "available_points": earned, "maximum_available_points": available_max}
 
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_backtest_history(ticker: str, period: str) -> pd.DataFrame:
+    """Charge une seule série quotidienne ajustée, avec 300 jours de warm-up."""
+    years = {"1y": 1, "2y": 2, "3y": 3, "5y": 5}.get(period, 3)
+    analysis_start = pd.Timestamp.now(tz="UTC").tz_localize(None).normalize() - pd.DateOffset(years=years)
+    download_start = analysis_start - timedelta(days=300)
+    # auto_adjust garantit que tous les prix (signal, rendements, excursions) sont
+    # ajustés de façon cohérente pour splits et dividendes.
+    history = yf.download(ticker, start=download_start.date(), interval="1d",
+                          auto_adjust=True, progress=False, threads=False)
+    if history.empty:
+        return pd.DataFrame()
+    if isinstance(history.columns, pd.MultiIndex):
+        history.columns = history.columns.get_level_values(0)
+    if "Close" not in history:
+        return pd.DataFrame()
+    history = history.dropna(subset=["Close"]).copy()
+    history.attrs["analysis_start"] = analysis_start
+    return history
+
+
+def calculate_historical_timing_series(data: pd.DataFrame, mode: str) -> pd.DataFrame:
+    """Rejoue causalement le barème Timing technique, sans événements ni fondamentaux."""
+    if data.empty:
+        return pd.DataFrame()
+    indicators = calculate_indicators(data)
+    indicators["ATR14"] = calculate_atr(indicators)
+    rows: list[dict[str, Any]] = []
+    # Chaque tranche s'arrête à la séance notée : les calculs rolling/EWM et les
+    # zones ne peuvent donc observer aucune valeur future. Le barème reste celui
+    # de calculate_entry_timing, et Événements est retiré du dénominateur.
+    for position in range(len(indicators)):
+        prefix = indicators.iloc[:position + 1]
+        timing = calculate_entry_timing(prefix, {}, {}, mode)
+        criteria = [item for item in timing["criteria"]
+                    if item["category"] != "Événements" and item["available"]]
+        available = sum(item["max"] for item in criteria)
+        earned = sum(item["earned"] for item in criteria)
+        categories: dict[str, float | None] = {}
+        for category in ("Tendance", "Momentum", "Zone de prix", "Risque"):
+            selected = [item for item in criteria if item["category"] == category]
+            maximum = sum(item["max"] for item in selected)
+            categories[category] = sum(item["earned"] for item in selected) / maximum * 100 if maximum else None
+        row = indicators.iloc[position]
+        close, mm50, mm200 = row.get("Close"), row.get("MM50"), row.get("MM200")
+        rows.append({
+            "date": indicators.index[position], "close": close,
+            "timing_score": earned / available * 100 if available else None,
+            "timing_confidence": available,
+            "tendance_score": categories["Tendance"],
+            "momentum_score": categories["Momentum"], "zone_score": categories["Zone de prix"],
+            "risque_score": categories["Risque"], "RSI": row.get("RSI"),
+            "MACD": row.get("MACD"), "Signal MACD": row.get("Signal"),
+            "MM50": mm50, "MM200": mm200, "ATR14": row.get("ATR14"),
+            "distance_mm50": close / mm50 - 1 if valid_number(close) and valid_number(mm50) and mm50 else None,
+            "distance_mm200": close / mm200 - 1 if valid_number(close) and valid_number(mm200) and mm200 else None,
+            "_position": position,
+        })
+    return pd.DataFrame(rows).set_index("date", drop=False)
+
+
+def extract_backtest_signals(timing: pd.DataFrame, threshold: float,
+                             avoid_close: bool = True, *, low: bool = False) -> pd.DataFrame:
+    """Conserve les franchissements du seuil et applique éventuellement l'espacement."""
+    if timing.empty or "timing_score" not in timing:
+        return timing.iloc[0:0].copy()
+    score = timing["timing_score"]
+    crossing = (score <= threshold) & (score.shift(1) > threshold) if low else \
+               (score >= threshold) & (score.shift(1) < threshold)
+    candidates = timing.loc[crossing.fillna(False)].copy()
+    if not avoid_close or candidates.empty:
+        return candidates
+    kept: list[int] = []
+    last_position: int | None = None
+    for position in candidates["_position"].astype(int):
+        if last_position is None or position - last_position >= MIN_SIGNAL_GAP:
+            kept.append(position)
+            last_position = position
+    return candidates[candidates["_position"].isin(kept)].copy()
+
+
+def calculate_forward_returns(observations: pd.DataFrame, timeline: pd.DataFrame) -> pd.DataFrame:
+    """Calcule Close[T+h]/Close[T]-1 ; un horizon incomplet reste NaN."""
+    result = observations.copy()
+    closes = timeline["close"].reset_index(drop=True)
+    for horizon in BACKTEST_HORIZONS:
+        values: list[float | None] = []
+        for position in result["_position"].astype(int):
+            if position + horizon < len(closes) and valid_number(closes.iloc[position]):
+                future = closes.iloc[position + horizon]
+                values.append(float(future) / float(closes.iloc[position]) - 1 if valid_number(future) else None)
+            else:
+                values.append(None)
+        result[f"return_{horizon}"] = values
+    return result
+
+
+def calculate_signal_drawdowns(signals: pd.DataFrame, timeline: pd.DataFrame) -> pd.DataFrame:
+    """Ajoute le drawdown et la MFE observés de T à T+h inclus."""
+    result = signals.copy()
+    closes = timeline["close"].reset_index(drop=True)
+    for horizon in BACKTEST_HORIZONS:
+        drawdowns, mfes = [], []
+        for position in result["_position"].astype(int):
+            if position + horizon >= len(closes) or not valid_number(closes.iloc[position]):
+                drawdowns.append(None); mfes.append(None); continue
+            window = closes.iloc[position:position + horizon + 1].dropna()
+            reference = float(closes.iloc[position])
+            drawdowns.append(float(window.min()) / reference - 1 if not window.empty else None)
+            mfes.append(float(window.max()) / reference - 1 if not window.empty else None)
+        result[f"drawdown_{horizon}"] = drawdowns
+        result[f"mfe_{horizon}"] = mfes
+    return result
+
+
+def calculate_backtest_statistics(signals: pd.DataFrame) -> dict[str, Any]:
+    statistics: dict[str, Any] = {}
+    for horizon in BACKTEST_HORIZONS:
+        returns = signals.get(f"return_{horizon}", pd.Series(dtype=float)).dropna()
+        drawdowns = signals.get(f"drawdown_{horizon}", pd.Series(dtype=float)).dropna()
+        mfes = signals.get(f"mfe_{horizon}", pd.Series(dtype=float)).dropna()
+        statistics[horizon] = {
+            "observations": len(returns), "mean": returns.mean() if len(returns) else None,
+            "median": returns.median() if len(returns) else None,
+            "positive": (returns > 0).mean() if len(returns) else None,
+            "best": returns.max() if len(returns) else None, "worst": returns.min() if len(returns) else None,
+            "drawdown_mean": drawdowns.mean() if len(drawdowns) else None,
+            "drawdown_median": drawdowns.median() if len(drawdowns) else None,
+            "drawdown_worst": drawdowns.min() if len(drawdowns) else None,
+            "mfe_mean": mfes.mean() if len(mfes) else None, "mfe_median": mfes.median() if len(mfes) else None,
+        }
+    return statistics
+
+
+def calculate_baseline_statistics(timing: pd.DataFrame) -> dict[str, Any]:
+    """Baseline de toutes les séances admissibles de la fenêtre analysée."""
+    baseline = timing.copy()
+    baseline["_position"] = range(len(baseline))
+    return calculate_backtest_statistics(calculate_forward_returns(baseline, baseline))
+
+
+def sample_size_warning(n: int) -> str | None:
+    if n < 10:
+        return "⚠️ Échantillon très faible : résultat peu fiable."
+    if n < 30:
+        return "🟠 Échantillon limité : interpréter avec prudence."
+    return None
+
+
+def build_backtest_interpretation(high: dict[str, Any], baseline: dict[str, Any],
+                                  low: dict[str, Any], threshold: int) -> str:
+    """Lecture déterministe de l'horizon 20, favorable ou défavorable sans sélection."""
+    hs, bs, ls = high[20], baseline[20], low[20]
+    n = hs["observations"]
+    if not all(valid_number(item["mean"]) for item in (hs, bs, ls)):
+        return "Les observations disponibles ne suffisent pas pour comparer honnêtement les groupes à 20 séances."
+    detail = (f"Sur {n} signaux Timing ≥ {threshold}, la performance moyenne après 20 séances "
+              f"a été de {format_percentage(hs['mean'])}, contre {format_percentage(bs['mean'])} "
+              f"pour l’ensemble des séances admissibles. {hs['positive']:.0%} des signaux historiques "
+              "étudiés ont terminé positifs après 20 séances. ")
+    if hs["mean"] > bs["mean"] and hs["mean"] > ls["mean"]:
+        conclusion = "Les signaux élevés ont historiquement mieux performé dans cet échantillon."
+    else:
+        conclusion = ("Les signaux Timing élevés n’ont pas historiquement surperformé les séances ordinaires "
+                      "sur cet horizon ; le seuil actuel ne montre donc pas d’avantage clair.")
+    warning = sample_size_warning(n)
+    return detail + conclusion + (f" {warning}" if warning else "") + " Les résultats passés ne garantissent pas les résultats futurs."
+
+
+def render_backtest_charts(timing: pd.DataFrame, signals: pd.DataFrame, threshold: int) -> None:
+    price = go.Figure()
+    price.add_trace(go.Scatter(x=timing.index, y=timing["close"], name="Cours", mode="lines"))
+    if not signals.empty:
+        price.add_trace(go.Scatter(x=signals.index, y=signals["close"], name="Signaux",
+                                   mode="markers", marker={"size": 9, "color": "#34d399"}))
+    price.update_layout(title="Cours ajusté et signaux", height=330, margin=dict(l=10, r=10, t=50, b=10))
+    st.plotly_chart(price, use_container_width=True)
+    score = go.Figure(go.Scatter(x=timing.index, y=timing["timing_score"], name="Timing", mode="lines"))
+    score.add_hline(y=threshold, line_dash="dash", line_color="#fb923c")
+    score.update_yaxes(range=[0, 100], title="Timing /100")
+    score.update_layout(height=280, margin=dict(l=10, r=10, t=20, b=10))
+    st.plotly_chart(score, use_container_width=True)
+    returns = signals.get("return_20", pd.Series(dtype=float)).dropna() * 100
+    if not returns.empty:
+        histogram = go.Figure(go.Histogram(x=returns, nbinsx=15))
+        histogram.add_vline(x=0, line_dash="dash", line_color="#f87171")
+        histogram.update_layout(title="Distribution des performances 20 séances après signal",
+                                xaxis_title="Performance (%)", height=320,
+                                margin=dict(l=10, r=10, t=50, b=10))
+        st.plotly_chart(histogram, use_container_width=True)
+
+
+def render_backtest() -> None:
+    st.title("🧪 Backtest du moteur Timing")
+    st.caption("Évaluez historiquement le comportement des signaux Timing sur une action.")
+    st.info("Le backtest mesure le comportement passé du moteur Timing. Les performances historiques ne garantissent pas les performances futures.")
+    st.markdown("**Le backtest porte principalement sur les signaux techniques du moteur Timing. Les fondamentaux actuels ne sont pas réappliqués artificiellement au passé.**")
+    periods = {"1 an": "1y", "2 ans": "2y", "3 ans": "3y", "5 ans": "5y"}
+    c1, c2 = st.columns(2)
+    ticker = c1.text_input("Ticker", value="AAPL", key="backtest_ticker").strip().upper()
+    period_label = c2.selectbox("Période historique", list(periods), index=2)
+    threshold = st.slider("Signal Timing minimum", 40, 90, 70, format="%d/100")
+    avoid_close = st.checkbox("Éviter les signaux trop rapprochés", value=True)
+    if not st.button("▶️ Lancer le backtest", type="primary"):
+        return
+    if not ticker:
+        st.error("Aucune donnée historique exploitable trouvée pour ce ticker."); return
+    with st.spinner("Calcul historique causal en cours…"):
+        try:
+            history = load_backtest_history(ticker, periods[period_label])
+        except Exception:
+            history = pd.DataFrame()
+        if history.empty:
+            st.error("Aucune donnée historique exploitable trouvée pour ce ticker."); return
+        if len(history) < 200:
+            st.warning("Historique insuffisant pour réaliser un backtest fiable du moteur Timing."); return
+        full_timing = calculate_historical_timing_series(history, "Investisseur")
+        start = history.attrs.get("analysis_start", full_timing.index.min())
+        eligible = full_timing[(full_timing.index >= start) & full_timing["timing_score"].notna()].copy()
+        # MM200 impose réellement le warm-up ; aucune fausse valeur n'est injectée.
+        eligible = eligible[eligible["MM200"].notna()].copy()
+        if eligible.empty:
+            st.warning("Historique insuffisant pour réaliser un backtest fiable du moteur Timing."); return
+        high = extract_backtest_signals(eligible, threshold, avoid_close)
+        low_group = extract_backtest_signals(eligible, 50, avoid_close, low=True)
+        high = calculate_signal_drawdowns(calculate_forward_returns(high, full_timing), full_timing)
+        low_group = calculate_signal_drawdowns(calculate_forward_returns(low_group, full_timing), full_timing)
+        baseline_rows = calculate_forward_returns(eligible, full_timing)
+        high_stats, low_stats = calculate_backtest_statistics(high), calculate_backtest_statistics(low_group)
+        baseline_stats = calculate_backtest_statistics(baseline_rows)
+    metrics = st.columns(3)
+    metrics[0].metric("Nombre de signaux", len(high))
+    metrics[1].metric("Timing moyen au signal", f"{high['timing_score'].mean():.0f}/100" if not high.empty else "N/D")
+    metrics[2].metric("Période analysée", period_label)
+    buy_hold = eligible["close"].iloc[-1] / eligible["close"].iloc[0] - 1
+    st.caption(f"Performance de l’action sur la période (Buy & Hold, contexte uniquement) : {format_percentage(buy_hold)}")
+    warning = sample_size_warning(len(high))
+    if warning: st.warning(warning)
+    table = []
+    for horizon in BACKTEST_HORIZONS:
+        item = high_stats[horizon]
+        table.append({"Horizon": f"{horizon} séances", "Signaux": item["observations"],
+                      "Perf. moyenne": format_percentage(item["mean"]), "Médiane": format_percentage(item["median"]),
+                      "Positifs": f"{item['positive']:.0%}" if valid_number(item["positive"]) else "N/D",
+                      "Drawdown moyen": format_percentage(item["drawdown_mean"]),
+                      "Pire drawdown": format_percentage(item["drawdown_worst"]),
+                      "MFE moyen": format_percentage(item["mfe_mean"])})
+    st.dataframe(pd.DataFrame(table), hide_index=True, use_container_width=True)
+    st.subheader("📊 Le Timing discrimine-t-il réellement ?")
+    for horizon in BACKTEST_HORIZONS:
+        st.markdown(f"### Après {horizon} séances")
+        cols = st.columns(3)
+        groups = ((f"Timing ≥ {threshold}", high_stats[horizon]), ("Toutes les séances", baseline_stats[horizon]),
+                  ("Timing ≤ 50", low_stats[horizon]))
+        for column, (label, item) in zip(cols, groups):
+            column.metric(label, format_percentage(item["mean"]),
+                          f"{item['positive']:.0%} positifs" if valid_number(item["positive"]) else "N/D")
+        means = [item[1]["mean"] for item in groups]
+        if all(valid_number(value) for value in means):
+            if means[0] > means[1] and means[0] > means[2]:
+                st.success("✅ Historiquement, les signaux Timing élevés ont mieux performé sur cet horizon.")
+            elif abs(means[0] - means[1]) < .005:
+                st.info("🟠 L’avantage historique du Timing est faible sur cet horizon.")
+            else:
+                st.warning("⚠️ Le Timing élevé n’a pas apporté d’avantage historique sur cet horizon.")
+    render_backtest_charts(eligible, high, threshold)
+    with st.expander("Voir tous les signaux"):
+        detail = high.sort_index(ascending=False).copy()
+        shown = pd.DataFrame({"Date": detail.index.strftime("%d/%m/%Y"),
+            "Prix au signal": detail["close"].map(lambda x: f"{x:.2f}"),
+            "Timing": detail["timing_score"].map(lambda x: f"{x:.0f}/100"),
+            "RSI": detail["RSI"].map(lambda x: f"{x:.1f}" if valid_number(x) else "N/D"),
+            "Distance MM50": detail["distance_mm50"].map(format_percentage),
+            "Distance MM200": detail["distance_mm200"].map(format_percentage),
+            "+5j": detail["return_5"].map(format_percentage), "+20j": detail["return_20"].map(format_percentage),
+            "+60j": detail["return_60"].map(format_percentage), "Drawdown 20j": detail["drawdown_20"].map(format_percentage)})
+        st.dataframe(shown, hide_index=True, use_container_width=True)
+    st.subheader("🧭 Lecture du backtest")
+    st.write(build_backtest_interpretation(high_stats, baseline_stats, low_stats, threshold))
+    with st.expander("⚠️ Limites du backtest"):
+        st.markdown("""- Données historiques Yahoo susceptibles d’être ajustées ou incomplètes.
+- Fondamentaux point-in-time absents : les fondamentaux actuels ne sont jamais réappliqués au passé.
+- Événements historiques non intégrés et exclus du dénominateur.
+- Frais, fiscalité et stratégie de capital non simulés.
+- Performances basées sur les cours de clôture ajustés.
+- Échantillons parfois faibles ; les performances passées ne sont pas prédictives avec certitude.""")
+    st.markdown("*Ce backtest est un outil d’évaluation statistique du modèle. Il ne constitue pas une recommandation d’investissement et les performances passées ne garantissent pas les performances futures.*")
 
 def build_entry_decision(global_score: float, timing_result: dict[str, Any],
                          valuation_score: float | None) -> dict[str, str]:
@@ -1739,7 +2030,7 @@ if "analysis_ticker" not in st.session_state:
     st.session_state["analysis_ticker"] = "AAPL"
 with st.sidebar:
     navigation = st.radio(
-        "Mode", options=["📊 Analyse", "🥊 Comparateur", "🔎 Screener", "⭐ Watchlist"],
+        "Mode", options=["📊 Analyse", "🥊 Comparateur", "🔎 Screener", "⭐ Watchlist", "🧪 Backtest"],
         key="navigation_mode",
     )
     st.header("Paramètres d'analyse")
@@ -1784,5 +2075,7 @@ elif navigation == "🥊 Comparateur":
             render_comparison(snapshots[0], snapshots[1])
 elif navigation == "🔎 Screener":
     render_screener(selected_mode)
-else:
+elif navigation == "⭐ Watchlist":
     render_watchlist(selected_mode)
+else:
+    render_backtest()
