@@ -16,6 +16,8 @@ import streamlit as st
 import yfinance as yf
 from yfinance import EquityQuery
 from google import genai
+import research_lab as research
+from research_lab import RESEARCH_HORIZONS
 
 
 PERIODS = {"6 mois": "6mo", "1 an": "1y", "2 ans": "2y", "5 ans": "5y"}
@@ -3582,6 +3584,19 @@ def render_dashboard(ticker: str, period: str, mode: str) -> None:
     st.markdown("<p class='disclaimer'>Information éducative uniquement : cette analyse automatisée ne constitue ni un conseil en investissement, ni une recommandation d'achat ou de vente. Les données peuvent être incomplètes ou différées.</p>", unsafe_allow_html=True)
 
 
+@st.cache_data(show_spinner=False, max_entries=32)
+def prepare_research_features(history: pd.DataFrame) -> pd.DataFrame:
+    return research.prepare_research_features(history, prepare_historical_features)
+
+
+def prepare_forward_targets(features: pd.DataFrame) -> pd.DataFrame:
+    return research.prepare_forward_targets(features, calculate_forward_returns, calculate_signal_drawdowns)
+
+
+def render_research_lab() -> None:
+    research.render_research_lab(prepare_research_features, prepare_forward_targets, build_walk_forward_windows)
+
+
 apply_styles()
 initialize_watchlist()
 if "navigation_mode" not in st.session_state:
@@ -3590,7 +3605,7 @@ if "analysis_ticker" not in st.session_state:
     st.session_state["analysis_ticker"] = "AAPL"
 with st.sidebar:
     navigation = st.radio(
-        "Mode", options=["📊 Analyse", "🥊 Comparateur", "🔎 Screener", "⭐ Watchlist", "🧪 Backtest", "🧬 Timing Lab", "⏩ Walk-Forward Validation"],
+        "Mode", options=["📊 Analyse", "🥊 Comparateur", "🔎 Screener", "⭐ Watchlist", "🧪 Backtest", "🧬 Timing Lab", "⏩ Walk-Forward Validation", "🔬 Research Lab"],
         key="navigation_mode",
     )
     st.header("Paramètres d'analyse")
@@ -3641,5 +3656,7 @@ elif navigation == "🧪 Backtest":
     render_backtest()
 elif navigation == "🧬 Timing Lab":
     render_timing_lab()
+elif navigation == "🔬 Research Lab":
+    render_research_lab()
 else:
     render_walk_forward_validation()
