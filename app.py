@@ -294,9 +294,9 @@ def build_ai_snapshot(
     ticker: str,
     company_name: str,
     mode: str,
-    global_score: float,
+    global_score: float | None,
     verdict: str,
-    scores: dict[str, float],
+    scores: dict[str, float | None],
     info: dict[str, Any],
     current: float,
     rsi: Any,
@@ -324,7 +324,7 @@ def build_ai_snapshot(
         "ticker": ticker,
         "nom_entreprise": company_name,
         "profil": mode,
-        "score_global_sur_100": float(global_score),
+        "indice_global_normalise_sur_100": float(global_score) if valid_number(global_score) else None,
         "verdict": verdict,
         "scores_sur_100": available({
             "Fondamentaux": scores.get("Fondamentaux"),
@@ -452,9 +452,144 @@ def tier_score(value: Any, tiers: tuple[tuple[float, float], ...], default: floa
     return default
 
 
-def average_available(*scores: float | None) -> float:
-    available = [score for score in scores if score is not None]
-    return sum(available) / len(available) if available else 50.0
+def average_available(*scores: float | None) -> float | None:
+    available = [float(score) for score in scores if valid_number(score)]
+    return sum(available) / len(available) if available else None
+
+
+# Maxima des règles de score ci-dessous, y compris leurs branches par défaut.
+# Les métriques d'une catégorie ont le même poids dans leur moyenne.
+SCORING_METRIC_MAXIMA = {
+    "Fondamentaux": {"margin": 92, "roe": 92, "fcf": 78},
+    "Valorisation": {"pe": 90, "pb": 82},
+    "Croissance": {"revenue": 92, "earnings": 92},
+    "Technique": {"mm50": 78, "mm200": 82, "rsi": 82, "macd": 72},
+    "Risque": {"debt": 88, "volatility": 88, "beta": 82},
+}
+SCORING_CAPTION = (
+    "Indice interne basé sur les métriques disponibles ; il ne représente ni "
+    "une probabilité de hausse ni une recommandation."
+)
+
+
+def calculate_theoretical_score_bounds(mode: str) -> dict[str, Any]:
+    """Bornes supérieures des règles, sans estimation de performance prédictive.
+
+    La borne avec toutes les métriques est la moyenne de leurs maxima.
+    Avec une disponibilité inconnue, seul le maximum de ces maxima est une
+    borne sûre : omettre une métrique à plafond faible peut relever la moyenne.
+    """
+    weights = WEIGHTS[mode]
+    categories = {
+        category: sum(maxima.values()) / len(maxima)
+        for category, maxima in SCORING_METRIC_MAXIMA.items()
+    }
+    envelopes = {category: max(maxima.values()) for category, maxima in SCORING_METRIC_MAXIMA.items()}
+    total = sum(weights.values())
+    return {
+        "category_maxima": categories,
+        "category_envelopes": envelopes,
+        "maximum": sum(categories[key] * weight for key, weight in weights.items()) / total,
+        "maximum_with_missing_metrics": sum(envelopes[key] * weight for key, weight in weights.items()) / total,
+    }
+
+
+def calculate_global_score(
+    scores: dict[str, float | None], mode: str,
+    *, metric_scores: dict[str, dict[str, float | None]] | None = None,
+) -> dict[str, Any]:
+    """Renormalise les poids disponibles, puis rapporte le brut à sa borne.
+
+    Les vues fournissent toutes les métriques scorées pour calculer la borne
+    exacte de leurs règles disponibles. Sans ce détail, on utilise l'enveloppe
+    conservatrice des catégories, jamais leur maximum « données complètes ».
+    La borne est une limite des règles, pas un objectif normalement atteignable.
+    """
+    weights = WEIGHTS[mode]
+    available = [key for key in weights if valid_number(scores.get(key))]
+    missing = [key for key in weights if key not in available]
+    available_weight = sum(weights[key] for key in available)
+    total_weight = sum(weights.values())
+    bounds = calculate_theoretical_score_bounds(mode)
+    maxima = dict(bounds["category_envelopes"])
+    if metric_scores is not None:
+        for category in available:
+            maxima[category] = average_available(*(
+                maximum for metric, maximum in SCORING_METRIC_MAXIMA[category].items()
+                if valid_number(metric_scores.get(category, {}).get(metric))
+            ))
+            if maxima[category] is None:
+                raise ValueError(f"Métriques absentes pour la catégorie scorée {category}")
+    raw_score = (sum(float(scores[key]) * weights[key] for key in available) / available_weight
+                 if available_weight else None)
+    theoretical_max = (sum(maxima[key] * weights[key] for key in available) / available_weight
+                       if available_weight else None)
+    determinable = len(available) >= 2
+    return {
+        "score": max(0.0, min(100.0, raw_score / theoretical_max * 100)) if determinable else None,
+        "raw_score": raw_score,
+        "theoretical_max": theoretical_max,
+        "available_weight": available_weight,
+        "total_weight": total_weight,
+        "coverage_ratio": available_weight / total_weight,
+        "available_categories": available,
+        "missing_categories": missing,
+        "limited_coverage": 2 <= len(available) <= 3,
+        "status": "insufficient" if not determinable else "limited" if len(available) <= 3 else "available",
+        "normalization": "available_metrics" if metric_scores is not None else "category_envelopes",
+    }
+
+
+def calculate_data_coverage(metric_scores: dict[str, dict[str, float | None]]) -> dict[str, Any]:
+    """Compte les 14 entrées scorables ; MACD et signal forment une métrique.
+
+    Un P/E ou P/B non positif, une moyenne mobile nulle, ou un MACD sans
+    signal ne sont pas exploitables et ne comptent pas comme disponibles.
+    """
+    values = [metric_scores.get(category, {}).get(metric)
+              for category, maxima in SCORING_METRIC_MAXIMA.items() for metric in maxima]
+    available = sum(valid_number(value) for value in values)
+    return {"available": available, "total": len(values), "ratio": available / len(values)}
+
+
+def evaluate_scoring(data: pd.DataFrame, info: dict[str, Any], mode: str) -> dict[str, Any]:
+    """Point d'entrée commun à Analyse, Comparateur, Screener et Watchlist."""
+    metrics = calculate_scoring_metrics(data, info)
+    scores, favorable, unfavorable = score_analysis(data, info, mode)
+    return {
+        **calculate_global_score(scores, mode, metric_scores=metrics),
+        "scores": scores, "data_coverage": calculate_data_coverage(metrics),
+        "favorable": favorable, "unfavorable": unfavorable,
+    }
+
+
+def format_score(score: Any) -> str:
+    return f"{float(score):.0f}/100" if valid_number(score) else "N/D"
+
+
+def score_color(score: Any) -> str:
+    if not valid_number(score):
+        return "muted"
+    return "good" if score >= 70 else "warn" if score >= 55 else "bad"
+
+
+def render_scoring_details(result: dict[str, Any]) -> None:
+    """Affiche séparément couverture du modèle, des données et normalisation."""
+    coverage = result["data_coverage"]
+    st.caption(f"Couverture du modèle : {result['coverage_ratio']:.0%}")
+    st.caption(f"Couverture des données : {coverage['ratio']:.0%} — "
+               f"{coverage['available']}/{coverage['total']} indicateurs disponibles")
+    if result["missing_categories"]:
+        st.caption("Catégories manquantes : " + ", ".join(result["missing_categories"]))
+    if result["score"] is None:
+        st.info("Score global non déterminable — données insuffisantes")
+    elif result["limited_coverage"]:
+        st.warning("⚠️ Score calculé sur une couverture limitée.")
+    if valid_number(result["raw_score"]):
+        st.caption(f"Normalisation : score brut {result['raw_score']:.2f} / "
+                   f"borne théorique des métriques disponibles {result['theoretical_max']:.2f} × 100, "
+                   "plafonné entre 0 et 100. Les scores de catégorie restent bruts.")
+    st.caption(SCORING_CAPTION)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -2366,18 +2501,22 @@ def build_entry_decision(global_score: float, timing_result: dict[str, Any],
     return {"verdict": main, "detail": secondary}
 
 
-def render_entry_timing(timing: dict[str, Any], global_score: float,
+def render_entry_timing(timing: dict[str, Any], global_score: float | None,
                         global_verdict: str, valuation_score: float | None,
                         currency: str, info: dict[str, Any]) -> None:
     """Affiche séparément qualité, Timing, confirmations et zones techniques."""
     st.subheader("🧭 Analyse du timing d'entrée")
     score = timing.get("score")
     score_text = f"{score:.0f}/100" if valid_number(score) else "N/D"
-    decision = build_entry_decision(global_score, timing, valuation_score)
+    decision = (build_entry_decision(global_score, timing, valuation_score)
+                if valid_number(global_score) else {
+                    "verdict": "⚪ Lecture combinée non déterminable — données multifactorielles insuffisantes",
+                    "detail": "",
+                })
     decision_detail = f'<p class="info">{escape(decision["detail"])}</p>' if decision["detail"] else ""
     st.markdown(
-        f'<div class="decision"><div class="trade-row"><span><b>QUALITÉ / SCORE GLOBAL</b><br>'
-        f'<span class="score">{global_score:.0f}<small>/100</small></span><br>{escape(global_verdict)}</span>'
+        f'<div class="decision"><div class="trade-row"><span><b>QUALITÉ / INDICE GLOBAL</b><br>'
+        f'<span class="score">{format_score(global_score)}</span><br>{escape(global_verdict)}</span>'
         f'<span><b>TIMING ACTUEL</b><br><span class="score">{escape(score_text)}</span><br>'
         f'{escape(timing["verdict"])}<br><span class="muted">Confiance Timing : {timing["confidence"]} %</span></span></div>'
         f'<p class="verdict">{escape(decision["verdict"])}</p>'
@@ -2406,7 +2545,7 @@ def render_entry_timing(timing: dict[str, Any], global_score: float,
                 warnings.append(f"Price / Book actuel : {float(info['priceToBook']):.1f}x")
         items = "".join(f"<li>{escape(text)}</li>" for text in warnings[:6]) or "<li>Aucun avertissement disponible</li>"
         st.markdown(f'<div class="card"><h3 class="warn">⚠️ À surveiller / raisons d’attendre</h3><ul>{items}</ul></div>', unsafe_allow_html=True)
-    if global_score >= 70 and valid_number(timing.get("distance_mm50")) and -.05 <= timing["distance_mm50"] < 0:
+    if valid_number(global_score) and global_score >= 70 and valid_number(timing.get("distance_mm50")) and -.05 <= timing["distance_mm50"] < 0:
         rsi_item = next((x for x in timing["criteria"] if x["key"] == "rsi"), None)
         above_200 = next((x for x in timing["criteria"] if x["key"] == "price_above_mm200"), None)
         if rsi_item and rsi_item["available"] and 35 <= rsi_item["current_value"] <= 50 and above_200 and above_200["passed"]:
@@ -2448,9 +2587,8 @@ def render_entry_timing(timing: dict[str, Any], global_score: float,
     st.markdown(f'<div class="card">{html}{reading_html}</div>', unsafe_allow_html=True)
 
 
-def score_analysis(data: pd.DataFrame, info: dict[str, Any], mode: str) -> tuple[dict[str, float], list[str], list[str]]:
-    """Calcule des scores gradués uniquement à partir des données disponibles."""
-    del mode  # Les pondérations propres au profil sont appliquées au score global.
+def calculate_scoring_metrics(data: pd.DataFrame, info: dict[str, Any]) -> dict[str, dict[str, float | None]]:
+    """Applique les règles multifactorielles existantes sans imputer les absences."""
     close = float(data["Close"].iloc[-1])
     mm50, mm200 = data["MM50"].iloc[-1], data["MM200"].iloc[-1]
     rsi, macd, signal = data["RSI"].iloc[-1], data["MACD"].iloc[-1], data["Signal"].iloc[-1]
@@ -2463,8 +2601,6 @@ def score_analysis(data: pd.DataFrame, info: dict[str, Any], mode: str) -> tuple
     distance_mm50 = close / float(mm50) - 1 if valid_number(mm50) and mm50 else None
     distance_mm200 = close / float(mm200) - 1 if valid_number(mm200) and mm200 else None
 
-    # Les maxima usuels restent sous 100 : une note parfaite exige ainsi des
-    # métriques exceptionnellement favorables dans toutes les catégories.
     margin_score = tier_score(margin, ((0, 15), (0.05, 35), (0.10, 55), (0.15, 70), (0.25, 82)), 92)
     roe_score = tier_score(roe, ((0, 15), (0.08, 40), (0.12, 58), (0.20, 75), (0.30, 86)), 92)
     fcf_score = None if not valid_number(free_cashflow) else (78 if free_cashflow > 0 else 22)
@@ -2480,13 +2616,27 @@ def score_analysis(data: pd.DataFrame, info: dict[str, Any], mode: str) -> tuple
     volatility_score = tier_score(volatility, ((0.15, 88), (0.25, 78), (0.35, 64), (0.50, 45), (0.70, 28)), 15)
     beta_score = tier_score(beta, ((0.8, 82), (1.1, 74), (1.4, 58), (1.8, 40), (2.5, 25)), 15)
 
-    scores = {
-        "Fondamentaux": average_available(margin_score, roe_score, fcf_score),
-        "Valorisation": average_available(pe_score, pb_score),
-        "Croissance": average_available(revenue_score, earnings_score),
-        "Technique": average_available(mm50_score, mm200_score, rsi_score, macd_score),
-        "Risque": average_available(debt_score, volatility_score, beta_score),
+    return {
+        "Fondamentaux": {"margin": margin_score, "roe": roe_score, "fcf": fcf_score},
+        "Valorisation": {"pe": pe_score, "pb": pb_score},
+        "Croissance": {"revenue": revenue_score, "earnings": earnings_score},
+        "Technique": {"mm50": mm50_score, "mm200": mm200_score, "rsi": rsi_score, "macd": macd_score},
+        "Risque": {"debt": debt_score, "volatility": volatility_score, "beta": beta_score},
     }
+
+
+def score_analysis(data: pd.DataFrame, info: dict[str, Any], mode: str) -> tuple[dict[str, float | None], list[str], list[str]]:
+    """Calcule des scores gradués uniquement à partir des données disponibles."""
+    del mode  # Les pondérations propres au profil sont appliquées au score global.
+    close = float(data["Close"].iloc[-1])
+    mm200 = data["MM200"].iloc[-1]
+    macd, signal = data["MACD"].iloc[-1], data["Signal"].iloc[-1]
+    pe, margin = info.get("trailingPE"), info.get("profitMargins")
+    revenue_growth, earnings_growth = info.get("revenueGrowth"), info.get("earningsGrowth")
+    distance_mm200 = close / float(mm200) - 1 if valid_number(mm200) and mm200 else None
+
+    scores = {category: average_available(*metrics.values())
+              for category, metrics in calculate_scoring_metrics(data, info).items()}
     favorable: list[str] = []
     unfavorable: list[str] = []
     if valid_number(margin):
@@ -2691,38 +2841,36 @@ def build_screener_row(
     volatility = data["Close"].pct_change().dropna().std() * sqrt(252)
     distance_mm50 = current / float(mm50) - 1 if valid_number(mm50) and float(mm50) else None
     distance_mm200 = current / float(mm200) - 1 if valid_number(mm200) and float(mm200) else None
-    scores, _, _ = score_analysis(data, info, mode)
-    global_score = sum(scores[key] * WEIGHTS[mode][key] for key in scores) / 100
-    confidence_metrics = (
-        info.get("trailingPE"), info.get("profitMargins"), info.get("revenueGrowth"),
-        info.get("earningsGrowth"), info.get("returnOnEquity"), info.get("freeCashflow"),
-        info.get("priceToBook"), info.get("debtToEquity"), info.get("beta"), volatility,
-        rsi, mm50, mm200,
-    )
+    scoring = evaluate_scoring(data, info, mode)
     return {
         "ticker": ticker,
         "name": str(info.get("longName") or info.get("shortName") or ticker),
         "currency": str(info.get("currency") or ""),
-        "global_score": global_score,
-        "confidence": round(sum(valid_number(item) for item in confidence_metrics) / len(confidence_metrics) * 100),
+        "global_score": scoring["score"],
+        "scoring": scoring,
+        "data_coverage": scoring["data_coverage"],
         "price": current,
         "daily_change": current / float(previous) - 1 if valid_number(previous) and float(previous) else None,
         "pe": info.get("trailingPE"), "margin": info.get("profitMargins"),
         "revenue_growth": info.get("revenueGrowth"), "rsi": rsi,
         "volatility": volatility, "mm50": distance_mm50, "mm200": distance_mm200,
         "above_mm200": distance_mm200 is not None and distance_mm200 > 0,
-        "scores": scores,
+        "scores": scoring["scores"],
     }
 
 
 def filter_screener_results(
     rows: list[dict[str, Any]], minimum_score: float, maximum_pe: float,
     ignore_pe: bool, minimum_growth: float, require_mm200: bool, limit: int,
+    minimum_coverage: float = 0.70,
 ) -> list[dict[str, Any]]:
     """Applique les filtres sans convertir les fondamentaux absents en zéro."""
     selected = []
     for row in rows:
         if not valid_number(row.get("global_score")) or float(row["global_score"]) < minimum_score:
+            continue
+        coverage = row.get("data_coverage", {}).get("ratio")
+        if not valid_number(coverage) or float(coverage) < minimum_coverage:
             continue
         pe = row.get("pe")
         if not ignore_pe and (not valid_number(pe) or float(pe) <= 0 or float(pe) > maximum_pe):
@@ -2745,18 +2893,19 @@ def render_chart(data: pd.DataFrame, ticker: str) -> None:
     st.plotly_chart(figure, use_container_width=True)
 
 
-def score_verdict(score: float) -> str:
+def score_verdict(score: float | None) -> str:
+    """Bandes de l'indice normalisé ; une absence n'a aucun verdict chiffré."""
+    if not valid_number(score):
+        return "Score global non déterminable — données insuffisantes"
     if score >= 85:
-        return "Exceptionnel / Très favorable"
+        return "Très favorable"
     if score >= 70:
         return "Favorable"
     if score >= 55:
-        return "Plutôt favorable / équilibré"
+        return "Équilibré"
     if score >= 40:
-        return "Neutre / prudence"
-    if score >= 25:
-        return "Défavorable"
-    return "Très défavorable"
+        return "Prudence"
+    return "Défavorable"
 
 
 def calculate_trade_levels(current: float, mode: str, method: str = "mechanical") -> tuple[float, float]:
@@ -2801,7 +2950,7 @@ def build_summary(
     elif position_52w is not None and position_52w <= 0.20:
         cautions.append(f"le cours se situe à seulement {position_52w:.0%} de sa fourchette 52 semaines")
     if not strengths:
-        strengths.append("au moins une composante du modèle conserve un score relatif positif")
+        strengths.append("aucune force suffisamment documentée ne peut être identifiée")
     if not cautions:
         cautions.append("les données historiques et fondamentales restent incomplètes et ne préjugent pas des performances futures")
     return (
@@ -2819,8 +2968,7 @@ def build_comparison_snapshot(ticker: str, period: str, mode: str) -> dict[str, 
     current = float(data["Close"].iloc[-1])
     previous = float(data["Close"].iloc[-2]) if len(data) > 1 else None
     mm50, mm200 = data["MM50"].iloc[-1], data["MM200"].iloc[-1]
-    scores, _, _ = score_analysis(data, info, mode)
-    weights = WEIGHTS[mode]
+    scoring = evaluate_scoring(data, info, mode)
     return {
         "ticker": ticker,
         "name": str(info.get("longName") or info.get("shortName") or ticker),
@@ -2837,15 +2985,31 @@ def build_comparison_snapshot(ticker: str, period: str, mode: str) -> dict[str, 
         "mm50": current / float(mm50) - 1 if valid_number(mm50) and mm50 else None,
         "mm200": current / float(mm200) - 1 if valid_number(mm200) and mm200 else None,
         "volatility": data["Close"].pct_change().std() * sqrt(252),
-        "global_score": sum(scores[key] * weights[key] for key in scores) / 100,
-        "scores": scores,
+        "global_score": scoring["score"],
+        "scores": scoring["scores"],
+        "scoring": scoring,
+        "data_coverage": scoring["data_coverage"],
     }
 
 
-def comparison_winner(metric: str, left: Any, right: Any, tickers: tuple[str, str]) -> str:
+def comparison_winner(
+    metric: str, left: Any, right: Any, tickers: tuple[str, str],
+    coverages: tuple[float | None, float | None] | None = None,
+) -> str:
     """Détermine l'avantage selon la nature du critère, sans noter les absences."""
     if metric == "price":
         return "—"
+    if metric == "global_score":
+        if not valid_number(left) or not valid_number(right):
+            return "Non comparable — données insuffisantes"
+        if coverages is None or not all(valid_number(value) for value in coverages):
+            return "Comparaison réservée — couverture inconnue"
+        # Réserve descriptive à partir de 20 points de couverture d'écart,
+        # sans pénalisation arbitraire du score par multiplication.
+        if abs(coverages[0] - coverages[1]) >= 0.20 - 1e-12:
+            return "Comparaison réservée — couvertures différentes"
+        if abs(float(left) - float(right)) < 3:
+            return "⚖️ Égalité"
     if not valid_number(left) and not valid_number(right):
         return "—"
     if not valid_number(left):
@@ -2882,6 +3046,22 @@ def comparison_winner(metric: str, left: Any, right: Any, tickers: tuple[str, st
     return f"🏆 {tickers[0] if better else tickers[1]}"
 
 
+def global_comparison_summary(left: dict[str, Any], right: dict[str, Any]) -> str:
+    coverages = (left["data_coverage"]["ratio"], right["data_coverage"]["ratio"])
+    outcome = comparison_winner("global_score", left["global_score"], right["global_score"],
+                                (left["ticker"], right["ticker"]), coverages)
+    if outcome.startswith("Non comparable"):
+        return "Indice global non comparable — données insuffisantes."
+    if outcome.startswith("Comparaison réservée"):
+        return ("Comparaison réservée : les couvertures des données diffèrent d'au moins 20 points. "
+                "L'indice supérieur ne suffit pas à départager ces entreprises.")
+    if set(left["scoring"]["available_categories"]) != set(right["scoring"]["available_categories"]):
+        return "Comparaison réservée : les indices reposent sur des catégories différentes."
+    if outcome.startswith("🏆"):
+        return f"Avantage sur l'indice interne : {outcome[2:]} (à couverture comparable)."
+    return "Les indices globaux restent très équilibrés."
+
+
 def build_head_to_head_summary(left: dict[str, Any], right: dict[str, Any]) -> str:
     """Produit une synthèse déterministe uniquement avec les mesures disponibles."""
     tickers = (left["ticker"], right["ticker"])
@@ -2897,12 +3077,7 @@ def build_head_to_head_summary(left: dict[str, Any], right: dict[str, Any]) -> s
     )
     if technical_winner.startswith("🏆"):
         sentences.append(f"sur le plan technique, {technical_winner[2:]} obtient le meilleur score")
-    score_gap = left["global_score"] - right["global_score"]
-    if abs(score_gap) >= 3:
-        winner = tickers[0] if score_gap > 0 else tickers[1]
-        sentences.append(f"le score global donne actuellement un avantage à {winner}")
-    else:
-        sentences.append("les scores globaux restent très équilibrés")
+    sentences.append(global_comparison_summary(left, right).rstrip("."))
     return ". ".join(sentence[0].upper() + sentence[1:] for sentence in sentences) + "."
 
 
@@ -2911,7 +3086,7 @@ def render_comparison(left: dict[str, Any], right: dict[str, Any]) -> None:
     card_columns = st.columns([1, 0.18, 1])
     for column, snapshot in ((card_columns[0], left), (card_columns[2], right)):
         score = snapshot["global_score"]
-        color = "good" if score >= 70 else ("warn" if score >= 50 else "bad")
+        color = score_color(score)
         details = (
             f"P/E : {float(snapshot['pe']):.1f}x" if valid_number(snapshot["pe"]) else "P/E : N/D"
         )
@@ -2922,22 +3097,19 @@ def render_comparison(left: dict[str, Any], right: dict[str, Any]) -> None:
             st.markdown(
                 f'<div class="decision"><h3>{escape(snapshot["name"])}</h3>'
                 f'<div class="meta"><b>{escape(snapshot["ticker"])} · {escape(snapshot["exchange"])} · {escape(snapshot["currency"])}</b></div>'
-                f'<div class="score {color}">{score:.0f}<span style="font-size:1rem"> / 100</span></div>'
+                f'<div class="muted">INDICE GLOBAL</div><div class="score {color}">{format_score(score)}</div>'
                 f'<p>{details}</p></div>', unsafe_allow_html=True,
             )
+            render_scoring_details(snapshot["scoring"])
     card_columns[1].markdown("<h2 style='text-align:center;padding-top:5rem'>VS</h2>", unsafe_allow_html=True)
-    gap = left["global_score"] - right["global_score"]
-    if abs(gap) >= 3:
-        st.subheader(f"🏆 Avantage global : {left['ticker'] if gap > 0 else right['ticker']}")
-    else:
-        st.subheader("⚖️ Comparaison très équilibrée")
-    st.caption("Le score global est un outil de comparaison multifactorielle et ne constitue pas une recommandation d'investissement.")
+    st.subheader(global_comparison_summary(left, right))
 
     def ratio(value: Any) -> str:
         return f"{float(value):.1f}x" if valid_number(value) else "N/D"
 
     rows = [
-        ("Score global", "global_score", left["global_score"], right["global_score"], lambda v: f"{v:.0f}/100"),
+        ("Indice global", "global_score", left["global_score"], right["global_score"], format_score),
+        ("Couverture des données", "coverage", left["data_coverage"]["ratio"], right["data_coverage"]["ratio"], lambda v: f"{v:.0%}"),
         ("Prix actuel", "price", left["price"], right["price"], format_price),
         ("Variation journalière", "daily_change", left["daily_change"], right["daily_change"], format_percentage),
         ("P/E", "pe", left["pe"], right["pe"], ratio),
@@ -2951,7 +3123,7 @@ def render_comparison(left: dict[str, Any], right: dict[str, Any]) -> None:
         ("Distance à MM200", "mm200", left["mm200"], right["mm200"], format_percentage),
     ]
     for score_name in WEIGHTS[next(iter(WEIGHTS))]:
-        rows.append((f"Score {score_name}", "score", left["scores"][score_name], right["scores"][score_name], lambda v: f"{v:.0f}/100"))
+        rows.append((f"Score {score_name}", "score", left["scores"][score_name], right["scores"][score_name], format_score))
     table = []
     for label, key, a, b, formatter in rows:
         if key == "price":
@@ -2959,9 +3131,15 @@ def render_comparison(left: dict[str, Any], right: dict[str, Any]) -> None:
             right_text = formatter(b, CURRENCY_SYMBOLS.get(right["currency"], f"{right['currency']} "))
         else:
             left_text, right_text = formatter(a), formatter(b)
+        advantage = comparison_winner(
+            key, a, b, (left["ticker"], right["ticker"]),
+            (left["data_coverage"]["ratio"], right["data_coverage"]["ratio"]),
+        )
+        if key == "global_score" and set(left["scoring"]["available_categories"]) != set(right["scoring"]["available_categories"]):
+            advantage = "Comparaison réservée — catégories différentes"
         table.append({
             "Critère": label, "Action A": left_text, "Action B": right_text,
-            "Avantage": comparison_winner(key, a, b, (left["ticker"], right["ticker"])),
+            "Avantage": advantage,
         })
     st.dataframe(pd.DataFrame(table), hide_index=True, use_container_width=True)
     st.subheader("Résumé du face-à-face")
@@ -2989,7 +3167,13 @@ def _format_screener_table(
         mm200 = row.get("mm200")
         formatted = {
             "Ticker": row["ticker"], "Société": row["name"],
-            "Score": f"{row['global_score']:.0f}", "Confiance": f"{row['confidence']} %",
+            "Indice": format_score(row["global_score"]),
+            "Couverture": f"{row['data_coverage']['ratio']:.0%}",
+            "Couverture du modèle": f"{row['scoring']['coverage_ratio']:.0%}",
+            "Score brut": f"{row['scoring']['raw_score']:.2f}" if valid_number(row['scoring']['raw_score']) else "N/D",
+            "Borne théorique": f"{row['scoring']['theoretical_max']:.2f}" if valid_number(row['scoring']['theoretical_max']) else "N/D",
+            "Réserve": ("Données insuffisantes" if row["global_score"] is None else
+                        "⚠️ Score calculé sur une couverture limitée." if row['scoring']['limited_coverage'] else "—"),
             "Prix": format_price(row.get("price"), currency),
             "Variation jour": format_percentage(row.get("daily_change")),
             "P/E": f"{float(row['pe']):.1f}x" if valid_number(row.get("pe")) else "N/D",
@@ -3004,7 +3188,7 @@ def _format_screener_table(
         if include_verdict:
             formatted = {
                 **dict(list(formatted.items())[:3]),
-                "Verdict": score_verdict(float(row["global_score"])),
+                "Verdict": score_verdict(row["global_score"]),
                 **dict(list(formatted.items())[3:]),
             }
         table.append(formatted)
@@ -3032,6 +3216,8 @@ def render_watchlist(mode: str) -> None:
     """Affiche, importe, exporte et gère les actions favorites."""
     st.title("⭐ Ma Watchlist")
     st.caption("Suivez rapidement vos actions favorites avec le même modèle multifactoriel.")
+    st.caption(SCORING_CAPTION)
+    st.caption("Indice normalisé = score brut / borne théorique des métriques disponibles × 100, plafonné entre 0 et 100. Couverture : part des indicateurs exploitables.")
     watchlist: list[str] = st.session_state["watchlist"]
 
     add_col, button_col = st.columns([4, 1])
@@ -3089,7 +3275,7 @@ def render_watchlist(mode: str) -> None:
         st.caption("Les scores et données sont fournis à titre informatif et peuvent être incomplets ou différés. Ils ne constituent pas une recommandation d'investissement.")
         return
 
-    signature = (tuple(watchlist), mode)
+    signature = (tuple(watchlist), mode, "scoring-v2")
     refresh = st.button("🔄 Actualiser la Watchlist", key="watchlist_refresh")
     if refresh or st.session_state.get("watchlist_signature") != signature:
         with st.spinner("Actualisation de la Watchlist…"):
@@ -3139,6 +3325,8 @@ def render_screener(mode: str) -> None:
     """Affiche les critères, orchestre l'analyse limitée et restitue le classement."""
     st.title("🔎 Screener d'actions")
     st.caption("Explorez plusieurs actions avec le même modèle multifactoriel.")
+    st.caption(SCORING_CAPTION)
+    st.caption("Indice normalisé = score brut / borne théorique des métriques disponibles × 100, plafonné entre 0 et 100. Couverture : part des indicateurs exploitables.")
     market = st.selectbox("Marché", ("🇫🇷 France", "🇺🇸 États-Unis", "✏️ Liste personnalisée"), key="screener_market")
     custom_value = ""
     if market == "✏️ Liste personnalisée":
@@ -3151,6 +3339,10 @@ def render_screener(mode: str) -> None:
     col1, col2 = st.columns(2)
     with col1:
         minimum_score = st.slider("Score minimum", 0, 100, 65, key="screener_minimum_score")
+        minimum_coverage_percent = st.selectbox(
+            "Couverture minimale des données", (50, 60, 70, 80, 90), index=2,
+            format_func=lambda value: f"{value} %", key="screener_minimum_coverage",
+        )
         maximum_pe = st.slider("P/E maximum", 5, 80, 30, key="screener_maximum_pe")
         ignore_pe = st.checkbox("Ne pas filtrer sur le P/E", key="screener_ignore_pe")
     with col2:
@@ -3188,16 +3380,19 @@ def render_screener(mode: str) -> None:
                 progress.progress(index / len(candidates))
             progress.empty()
             status.empty()
-            filtered = filter_screener_results(
-                rows, minimum_score, maximum_pe, ignore_pe,
-                minimum_growth_percent / 100, require_mm200, result_limit,
-            )
-            st.session_state["screener_run"] = {"examined": len(candidates), "rows": filtered}
+            st.session_state["screener_run"] = {"examined": len(candidates), "rows": rows, "mode": mode}
 
     run = st.session_state.get("screener_run")
     if run is None:
         return
-    rows = run["rows"]
+    if run.get("mode", mode) != mode:
+        st.info("Relancez la recherche pour appliquer le nouveau profil.")
+        return
+    rows = filter_screener_results(
+        run["rows"], minimum_score, maximum_pe, ignore_pe,
+        minimum_growth_percent / 100, require_mm200, result_limit,
+        minimum_coverage=minimum_coverage_percent / 100,
+    )
     metrics = st.columns(3)
     metrics[0].metric("Actions examinées", run["examined"])
     metrics[1].metric("Actions retenues", len(rows))
@@ -3247,17 +3442,10 @@ def render_dashboard(ticker: str, period: str, mode: str) -> None:
     range_52 = high_52 - low_52
     position_52w = (current - low_52) / range_52 if valid_number(range_52) and range_52 > 0 else None
     rsi, macd, signal = data["RSI"].iloc[-1], data["MACD"].iloc[-1], data["Signal"].iloc[-1]
-    scores, favorable, unfavorable = score_analysis(data, info, mode)
-    weights = WEIGHTS[mode]
-    global_score = sum(scores[key] * weights[key] for key in scores) / 100
-    confidence_metrics = (
-        info.get("trailingPE"), info.get("profitMargins"), info.get("revenueGrowth"),
-        info.get("earningsGrowth"), info.get("returnOnEquity"), info.get("freeCashflow"),
-        info.get("priceToBook"), info.get("debtToEquity"), info.get("beta"), volatility,
-        rsi, mm50, mm200,
-    )
-    available_count = sum(valid_number(metric) for metric in confidence_metrics)
-    confidence_percent = round(available_count / len(confidence_metrics) * 100)
+    scoring = evaluate_scoring(data, info, mode)
+    scores = scoring["scores"]
+    favorable, unfavorable = scoring["favorable"], scoring["unfavorable"]
+    global_score = scoring["score"]
     verdict = score_verdict(global_score)
     # Une seule collecte événementielle par analyse ; le même objet alimente
     # l'interface, le moteur Timing et l'instantané Gemini.
@@ -3298,20 +3486,25 @@ def render_dashboard(ticker: str, period: str, mode: str) -> None:
 
     left, right = st.columns([1, 1.4])
     with left:
-        color = "good" if global_score >= 70 else ("warn" if global_score >= 50 else "bad")
+        color = score_color(global_score)
         st.markdown(f"""
         <div class="decision">
-          <div class="muted">SCORE GLOBAL</div>
-          <div class="score {color}">{global_score:.0f}<span style="font-size:1rem">/100</span></div>
+          <div class="muted">INDICE GLOBAL</div>
+          <div class="score {color}">{format_score(global_score)}</div>
           <div class="verdict">{escape(verdict)}</div>
-          <div class="muted">Confiance : <b>{confidence_percent} % — {available_count}/{len(confidence_metrics)} indicateurs disponibles</b></div>
         </div>
         """, unsafe_allow_html=True)
+        render_scoring_details(scoring)
     with right:
-        bars = "".join(
-            f'<div class="bar-row"><span>{escape(label)}</span><div class="bar-track"><div class="bar-fill" style="width:{score:.0f}%;background:{"#34d399" if score >= 65 else "#fb923c" if score >= 45 else "#f87171"}"></div></div><b>{score:.0f}/100</b></div>'
-            for label, score in scores.items()
-        )
+        bars = ""
+        for label, score in scores.items():
+            width = float(score) if valid_number(score) else 0
+            color = "#94a3b8" if score is None else "#34d399" if score >= 65 else "#fb923c" if score >= 45 else "#f87171"
+            bars += (
+                f'<div class="bar-row"><span>{escape(label)}</span><div class="bar-track">'
+                f'<div class="bar-fill" style="width:{width:.0f}%;background:{color}"></div></div>'
+                f'<b>{format_score(score)}</b></div>'
+            )
         st.markdown(f'<div class="card"><h3>Analyse multifactorielle</h3>{bars}</div>', unsafe_allow_html=True)
 
     st.subheader("Graphique & moyennes mobiles")
@@ -3363,6 +3556,10 @@ def render_dashboard(ticker: str, period: str, mode: str) -> None:
         rsi, macd, signal, volatility, distance_mm50, distance_mm200, position_52w,
         events, timing,
     )
+    ai_snapshot["scoring_v2"] = {
+        key: scoring[key] for key in ("raw_score", "theoretical_max", "coverage_ratio",
+                                      "data_coverage", "missing_categories", "status")
+    }
     render_ai_opinion(ai_snapshot, ticker, mode, period)
 
     st.subheader("Synthèse d'aide à la décision")
