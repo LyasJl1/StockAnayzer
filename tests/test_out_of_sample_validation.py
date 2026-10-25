@@ -12,8 +12,6 @@ NAMES = {"valid_number", "calculate_alpha", "format_alpha", "split_validation_un
          "aggregate_out_of_sample", "out_of_sample_robustness",
          "build_out_of_sample_interpretation", "build_horizon_stability",
          "build_v3_oos_interpretation", "aggregate_v3_confirmations",
-         "aggregate_unconfirmed_v3_alpha"}
-         "build_v3_oos_interpretation", "aggregate_v3_confirmations"}
          "aggregate_unconfirmed_v3_alpha", "_render_out_of_sample_results"}
 tree = ast.parse(Path("app.py").read_text(encoding="utf-8"))
 nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in NAMES]
