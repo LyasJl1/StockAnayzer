@@ -7,6 +7,7 @@ import json
 from datetime import date, datetime, timedelta, timezone
 from html import escape
 from math import isfinite, sqrt
+from time import perf_counter
 from typing import Any
 
 import pandas as pd
@@ -500,6 +501,22 @@ def calculate_atr(data: pd.DataFrame, period: int = 14) -> pd.Series:
     return atr.where(atr > 0)
 
 
+def prepare_historical_features(data: pd.DataFrame) -> pd.DataFrame:
+    """Calcule une fois le socle causal commun aux moteurs historiques."""
+    if data.empty or "Close" not in data:
+        return pd.DataFrame(index=data.index)
+    frame = calculate_indicators(data)
+    close = frame["Close"]
+    frame["ATR14"] = calculate_atr(frame)
+    frame["distance_mm50"] = close.div(frame["MM50"]).sub(1).where(frame["MM50"].ne(0))
+    frame["distance_mm200"] = close.div(frame["MM200"]).sub(1).where(frame["MM200"].ne(0))
+    frame["high_20"] = close.rolling(20).max()
+    frame["mm50_slope_10"] = frame["MM50"] - frame["MM50"].shift(10)
+    frame["mm200_slope_20"] = frame["MM200"] - frame["MM200"].shift(20)
+    frame["volatility_252"] = close.pct_change().expanding(min_periods=2).std() * sqrt(252)
+    return frame
+
+
 def calculate_price_zones(data: pd.DataFrame, atr: float | None) -> dict[str, Any]:
     """Repère les pivots proches sur 60 séances, sans extrapoler de niveau."""
     result: dict[str, Any] = {"support": None, "resistance": None,
@@ -717,43 +734,56 @@ def load_backtest_history(ticker: str, period: str) -> pd.DataFrame:
 
 
 def calculate_historical_timing_series(data: pd.DataFrame, mode: str) -> pd.DataFrame:
-    """Rejoue causalement le barème Timing technique, sans événements ni fondamentaux."""
+    """Rejoue causalement le barème Timing technique, de façon vectorielle."""
+    del mode
     if data.empty:
         return pd.DataFrame()
-    indicators = calculate_indicators(data)
-    indicators["ATR14"] = calculate_atr(indicators)
-    rows: list[dict[str, Any]] = []
-    # Chaque tranche s'arrête à la séance notée : les calculs rolling/EWM et les
-    # zones ne peuvent donc observer aucune valeur future. Le barème reste celui
-    # de calculate_entry_timing, et Événements est retiré du dénominateur.
-    for position in range(len(indicators)):
-        prefix = indicators.iloc[:position + 1]
-        timing = calculate_entry_timing(prefix, {}, {}, mode)
-        criteria = [item for item in timing["criteria"]
-                    if item["category"] != "Événements" and item["available"]]
-        available = sum(item["max"] for item in criteria)
-        earned = sum(item["earned"] for item in criteria)
-        categories: dict[str, float | None] = {}
-        for category in ("Tendance", "Momentum", "Zone de prix", "Risque"):
-            selected = [item for item in criteria if item["category"] == category]
-            maximum = sum(item["max"] for item in selected)
-            categories[category] = sum(item["earned"] for item in selected) / maximum * 100 if maximum else None
-        row = indicators.iloc[position]
-        close, mm50, mm200 = row.get("Close"), row.get("MM50"), row.get("MM200")
-        rows.append({
-            "date": indicators.index[position], "close": close,
-            "timing_score": earned / available * 100 if available else None,
-            "timing_confidence": available,
-            "tendance_score": categories["Tendance"],
-            "momentum_score": categories["Momentum"], "zone_score": categories["Zone de prix"],
-            "risque_score": categories["Risque"], "RSI": row.get("RSI"),
-            "MACD": row.get("MACD"), "Signal MACD": row.get("Signal"),
-            "MM50": mm50, "MM200": mm200, "ATR14": row.get("ATR14"),
-            "distance_mm50": close / mm50 - 1 if valid_number(close) and valid_number(mm50) and mm50 else None,
-            "distance_mm200": close / mm200 - 1 if valid_number(close) and valid_number(mm200) and mm200 else None,
-            "_position": position,
-        })
-    return pd.DataFrame(rows).set_index("date", drop=False)
+    f = data
+    if not {"MM50", "MM200", "RSI", "MACD", "Signal", "ATR14", "volatility_252"}.issubset(f.columns):
+        f = calculate_indicators(data)
+        f["ATR14"] = calculate_atr(f)
+        f["volatility_252"] = f["Close"].pct_change().expanding(min_periods=2).std() * (252 ** .5)
+    close, mm50, mm200, rsi = f["Close"], f["MM50"], f["MM200"], f["RSI"]
+    macd, signal, atr = f["MACD"], f["Signal"], f["ATR14"]
+    components: dict[str, list[tuple[pd.Series, pd.Series, float]]] = {k: [] for k in ("tendance", "momentum", "zone", "risque")}
+    def add(cat: str, points: pd.Series, available: pd.Series, maximum: float) -> None:
+        components[cat].append((points.where(available), available, maximum))
+    add("tendance", (close > mm200).astype(float)*10, close.notna() & mm200.notna(), 10)
+    add("tendance", (close > mm50).astype(float)*8, close.notna() & mm50.notna(), 8)
+    add("tendance", (mm50 > mm200).astype(float)*8, mm50.notna() & mm200.notna(), 8)
+    add("tendance", (mm50 > mm50.shift(10)).astype(float)*4, mm50.notna() & mm50.shift(10).notna(), 4)
+    rp = pd.Series(4.0, index=f.index).mask(rsi > 70, 2).mask((rsi > 30) & (rsi < 40), 3).mask((rsi >= 40) & (rsi < 45), 6).mask((rsi > 60) & (rsi <= 70), 7).mask(rsi.between(45, 60), 10)
+    add("momentum", rp, rsi.notna(), 10)
+    gap = macd-signal
+    add("momentum", (macd > signal).astype(float)*10, macd.notna() & signal.notna(), 10)
+    add("momentum", (gap > gap.shift(5)).astype(float)*5, gap.notna() & gap.shift(5).notna(), 5)
+    distance = close.div(mm50).sub(1).where(mm50.ne(0))
+    dp = pd.Series(2.0, index=f.index).mask((distance > .10) & (distance <= .15), 4).mask((distance >= -.05) & (distance < -.02), 5).mask((distance > .05) & (distance <= .10), 7).mask(distance.between(-.02,.05),10)
+    add("zone", dp, distance.notna(), 10)
+    high = f["High"].rolling(252, min_periods=1).max() if "High" in f else pd.Series(index=f.index, dtype=float)
+    low = f["Low"].rolling(252, min_periods=1).min() if "Low" in f else pd.Series(index=f.index, dtype=float)
+    position = close.sub(low).div(high-low).where(high.gt(low))
+    pp = pd.Series(1.0,index=f.index).mask(position < .20,2).mask((position > .80)&(position <= .92),3).mask((position >= .20)&(position < .35),4).mask(position.between(.35,.80),5)
+    add("zone", pp, position.notna(), 5)
+    extension = close.sub(mm50).abs().div(atr).where(atr.gt(0))
+    ep = pd.Series(0.0,index=f.index).mask(extension <= 3,2).mask(extension <= 2,4).mask(extension <= 1,5)
+    add("zone", ep, extension.notna(), 5)
+    vol = f["volatility_252"]
+    vp = pd.Series(1.0,index=f.index).mask(vol <= .55,3).mask(vol <= .40,6).mask(vol <= .30,8).mask(vol < .20,10)
+    add("risque", vp, vol.notna(), 10)
+    atrp = atr.div(close).where(close.gt(0))
+    ap = pd.Series(0.0,index=f.index).mask(atrp <= .06,1).mask(atrp <= .045,3).mask(atrp <= .03,4).mask(atrp < .02,5)
+    add("risque", ap, atrp.notna(), 5)
+    scores, maxima = {}, {}
+    for cat, items in components.items():
+        earned = sum((p.fillna(0) for p,_,_ in items), pd.Series(0.0,index=f.index))
+        maximum = sum((a.astype(float)*m for _,a,m in items), pd.Series(0.0,index=f.index))
+        scores[cat] = earned.div(maximum.where(maximum.gt(0))).mul(100); maxima[cat]=(earned,maximum)
+    earned = sum((x[0] for x in maxima.values()), pd.Series(0.0,index=f.index)); available=sum((x[1] for x in maxima.values()),pd.Series(0.0,index=f.index))
+    return pd.DataFrame({"date":f.index,"close":close,"timing_score":earned.div(available.where(available.gt(0))).mul(100),"timing_confidence":available,
+        "tendance_score":scores["tendance"],"momentum_score":scores["momentum"],"zone_score":scores["zone"],"risque_score":scores["risque"],
+        "RSI":rsi,"MACD":macd,"Signal MACD":signal,"MM50":mm50,"MM200":mm200,"ATR14":atr,"distance_mm50":distance,
+        "distance_mm200":close.div(mm200).sub(1).where(mm200.ne(0)),"_position":range(len(f))},index=f.index)
 
 
 def extract_backtest_signals(timing: pd.DataFrame, threshold: float,
@@ -780,15 +810,11 @@ def calculate_forward_returns(observations: pd.DataFrame, timeline: pd.DataFrame
     """Calcule Close[T+h]/Close[T]-1 ; un horizon incomplet reste NaN."""
     result = observations.copy()
     closes = timeline["close"].reset_index(drop=True)
+    positions = result["_position"].astype(int).to_numpy()
     for horizon in BACKTEST_HORIZONS:
-        values: list[float | None] = []
-        for position in result["_position"].astype(int):
-            if position + horizon < len(closes) and valid_number(closes.iloc[position]):
-                future = closes.iloc[position + horizon]
-                values.append(float(future) / float(closes.iloc[position]) - 1 if valid_number(future) else None)
-            else:
-                values.append(None)
-        result[f"return_{horizon}"] = values
+        future = closes.shift(-horizon)
+        values = future.div(closes).sub(1)
+        result[f"return_{horizon}"] = values.reindex(positions).to_numpy()
     return result
 
 
@@ -796,17 +822,16 @@ def calculate_signal_drawdowns(signals: pd.DataFrame, timeline: pd.DataFrame) ->
     """Ajoute le drawdown et la MFE observés de T à T+h inclus."""
     result = signals.copy()
     closes = timeline["close"].reset_index(drop=True)
+    positions = result["_position"].astype(int).to_numpy()
     for horizon in BACKTEST_HORIZONS:
-        drawdowns, mfes = [], []
-        for position in result["_position"].astype(int):
-            if position + horizon >= len(closes) or not valid_number(closes.iloc[position]):
-                drawdowns.append(None); mfes.append(None); continue
-            window = closes.iloc[position:position + horizon + 1].dropna()
-            reference = float(closes.iloc[position])
-            drawdowns.append(float(window.min()) / reference - 1 if not window.empty else None)
-            mfes.append(float(window.max()) / reference - 1 if not window.empty else None)
-        result[f"drawdown_{horizon}"] = drawdowns
-        result[f"mfe_{horizon}"] = mfes
+        # Un rolling renversé donne exactement min/max de [T, T+h].
+        future_min = closes.iloc[::-1].rolling(horizon + 1, min_periods=1).min().iloc[::-1]
+        future_max = closes.iloc[::-1].rolling(horizon + 1, min_periods=1).max().iloc[::-1]
+        complete = pd.Series(range(len(closes)), index=closes.index).add(horizon).lt(len(closes))
+        dd = future_min.div(closes).sub(1).where(complete)
+        mfe = future_max.div(closes).sub(1).where(complete)
+        result[f"drawdown_{horizon}"] = dd.reindex(positions).to_numpy()
+        result[f"mfe_{horizon}"] = mfe.reindex(positions).to_numpy()
     return result
 
 
@@ -844,8 +869,10 @@ def calculate_pullback_timing_series(data: pd.DataFrame) -> pd.DataFrame:
     """
     if data.empty or "Close" not in data:
         return pd.DataFrame()
-    frame = calculate_indicators(data)
-    frame["ATR14"] = calculate_atr(frame)
+    frame = data
+    if not {"MM50", "MM200", "RSI", "MACD", "Signal", "ATR14"}.issubset(frame.columns):
+        frame = calculate_indicators(data)
+        frame["ATR14"] = calculate_atr(frame)
     close, mm50, mm200 = frame["Close"], frame["MM50"], frame["MM200"]
     rsi, macd, signal, atr = frame["RSI"], frame["MACD"], frame["Signal"], frame["ATR14"]
     distance = close.div(mm50).sub(1).where(mm50.ne(0))
@@ -1098,16 +1125,39 @@ def calculate_rigorous_entry_v3(data: pd.DataFrame) -> dict[str, Any]:
 
 
 def calculate_v3_timing_series(data: pd.DataFrame) -> pd.DataFrame:
-    """Construit les états V3 causaux et les événements Early / Confirmed."""
+    """Construit en colonnes les états V3 causaux et événements Early / Confirmed."""
     frame = _v3_prepared(data)
-    rows = []
-    for position in range(len(frame)):
-        result = calculate_rigorous_entry_v3(frame.iloc[:position + 1])
-        rows.append({"date": frame.index[position], "close": frame["Close"].iloc[position],
-                     "regime_status": result["regime"]["status"], "setup_status": result["setup"]["status"],
-                     "trigger_status": result["trigger"]["status"],
-                     "v3_signal_strength": result["metrics"]["v3_signal_strength"], "_position": position})
-    series = pd.DataFrame(rows, index=frame.index)
+    if frame.empty:
+        return pd.DataFrame()
+    close, mm50, mm200 = frame["Close"], frame["MM50"], frame["MM200"]
+    rsi, macd, signal, atr = frame["RSI"], frame["MACD"], frame["Signal"], frame["ATR14"]
+    core_available = pd.concat([close.notna() & mm200.notna(), mm50.notna() & mm200.notna(), mm200.notna() & mm200.shift(20).notna()], axis=1)
+    core_passed = pd.concat([close > mm200, mm50 > mm200, mm200 > mm200.shift(20)], axis=1) & core_available
+    count = core_available.sum(axis=1); ratio = core_passed.sum(axis=1).div(count.where(count.gt(0)))
+    regime_status = pd.Series("Défavorable", index=frame.index).mask(ratio >= 2/3, "Mitigé").mask(ratio >= 1, "Favorable").mask(count.eq(0), "N/D")
+    distance = close.div(mm50).sub(1).where(mm50.ne(0)); distance200 = close.div(mm200).sub(1).where(mm200.ne(0))
+    extended = distance200.gt(.35) | distance.gt(.20)
+    atr_distance = close.sub(mm50).abs().div(atr).where(atr.gt(0))
+    setup_available = pd.concat([distance.notna(), rsi.notna(), atr_distance.notna()],axis=1)
+    setup_passed = pd.concat([distance.between(-.05,.03), rsi.between(35,52), atr_distance.le(2)],axis=1) & setup_available
+    context = regime_status.isin(["Favorable","Mitigé"])
+    present = context & distance.between(-.05,.03) & rsi.between(35,52) & ~extended
+    possible = context & setup_passed.sum(axis=1).ge(2) & ~extended
+    setup_status = pd.Series("Absent",index=frame.index).mask(possible,"Possible").mask(present,"Présent").mask(setup_available.sum(axis=1).eq(0),"N/D")
+    gap=macd-signal
+    prior_available = pd.concat([(close.shift(i).notna() & mm50.shift(i).notna()) for i in range(1,6)],axis=1).any(axis=1)
+    prior_below = pd.concat([(close.shift(i) < mm50.shift(i)) for i in range(1,6)],axis=1).any(axis=1)
+    trigger_available = pd.concat([close.notna()&close.shift(3).notna()&close.shift(1).notna(), rsi.notna()&rsi.shift(3).notna(), gap.notna()&gap.shift(3).notna()&gap.shift(5).notna(), macd.notna()&signal.notna(), close.notna()&mm50.notna()&prior_available],axis=1)
+    trigger_passed = pd.concat([(close>close.shift(3))&(close>close.shift(1)),(rsi>rsi.shift(3))&(rsi>=42),(gap>gap.shift(3))&(gap>gap.shift(5)),macd>signal,(close>mm50)&prior_below],axis=1) & trigger_available
+    passed=trigger_passed.sum(axis=1); trigger_status=pd.Series("Absent",index=frame.index).mask(passed.ge(1),"Partiel").mask(passed.ge(3),"Fort").mask(trigger_available.sum(axis=1).eq(0),"N/D")
+    regime_score = core_passed.mul([15,15,10],axis=1).sum(axis=1)
+    distance_points = pd.Series(0.0,index=frame.index).mask((distance>=-.08)&(distance<-.05),9).mask(distance.between(-.05,.03),15).mask((distance>.03)&(distance<=.08),6)
+    rsi_points = pd.Series(0.0,index=frame.index).mask(rsi.between(32,55),6).mask(rsi.between(38,50),10)
+    atr_points = pd.Series(0.0,index=frame.index).mask(atr_distance<=2,3).mask(atr_distance<=1,5)
+    trigger_score=trigger_passed.mul([7,6,7,5,5],axis=1).sum(axis=1)
+    strength=regime_score+distance_points+rsi_points+atr_points+trigger_score
+    strength=strength.where(regime_status.ne("Défavorable"),strength.clip(upper=55))
+    series=pd.DataFrame({"date":frame.index,"close":close,"regime_status":regime_status,"setup_status":setup_status,"trigger_status":trigger_status,"v3_signal_strength":strength.astype(float),"_position":range(len(frame))},index=frame.index)
     eligible = (series["regime_status"] == "Favorable") & (series["setup_status"] == "Présent")
     early_state = eligible & (series["trigger_status"] == "Partiel")
     confirmed_state = eligible & (series["trigger_status"] == "Fort")
@@ -1208,6 +1258,139 @@ def format_alpha(value: Any) -> str:
     return f"{float(value) * 100:+.1f} pt" if valid_number(value) else "N/D"
 
 
+def build_walk_forward_windows(start: Any, end: Any, observation_years: int = 3,
+                               validation_years: int = 1, step_years: int = 1) -> list[dict[str, Any]]:
+    """Construit des fenêtres calendaires glissantes, sans chevauchement observation/validation."""
+    start, end = pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize()
+    if observation_years < 1 or validation_years < 1 or step_years < 1 or start > end:
+        return []
+    windows, observation_start = [], start
+    while True:
+        validation_start = observation_start + pd.DateOffset(years=observation_years)
+        validation_end = validation_start + pd.DateOffset(years=validation_years) - pd.Timedelta(days=1)
+        if validation_end > end:
+            break
+        windows.append({
+            "window": f"{validation_start:%Y-%m-%d} → {validation_end:%Y-%m-%d}",
+            "observation_start": observation_start, "observation_end": validation_start - pd.Timedelta(days=1),
+            "validation_start": validation_start, "validation_end": validation_end,
+        })
+        observation_start += pd.DateOffset(years=step_years)
+    return windows
+
+
+def _bounded_window_statistics(observations: pd.DataFrame, timeline: pd.DataFrame,
+                               validation_start: Any, validation_end: Any) -> dict[int, dict[str, Any]]:
+    """Mesure les horizons sans jamais dépasser la dernière séance de validation."""
+    start, end = pd.Timestamp(validation_start), pd.Timestamp(validation_end)
+    eligible = observations.loc[(observations.index >= start) & (observations.index <= end)].copy()
+    closes = timeline["close"].reset_index(drop=True)
+    last_positions = timeline.loc[timeline.index <= end, "_position"]
+    last = int(last_positions.max()) if not last_positions.empty else -1
+    result: dict[int, dict[str, Any]] = {}
+    for horizon in BACKTEST_HORIZONS:
+        returns, drawdowns = [], []
+        for position in eligible.get("_position", pd.Series(dtype=int)).astype(int):
+            if position + horizon > last or position + horizon >= len(closes):
+                continue
+            reference, future = closes.iloc[position], closes.iloc[position + horizon]
+            if not valid_number(reference) or not valid_number(future) or not reference:
+                continue
+            returns.append(float(future) / float(reference) - 1)
+            path = closes.iloc[position:position + horizon + 1].dropna()
+            drawdowns.append(float(path.min()) / float(reference) - 1)
+        series, dd = pd.Series(returns, dtype=float), pd.Series(drawdowns, dtype=float)
+        result[horizon] = {
+            "observations": len(series), "mean": series.mean() if len(series) else None,
+            "median": series.median() if len(series) else None,
+            "positive": (series > 0).mean() if len(series) else None,
+            "drawdown_mean": dd.mean() if len(dd) else None,
+            "drawdown_worst": dd.min() if len(dd) else None,
+        }
+    return result
+
+
+def calculate_walk_forward(history: pd.DataFrame, ticker: str, windows: list[dict[str, Any]],
+                           engines: tuple[str, ...]) -> list[dict[str, Any]]:
+    """Pré-calcule chaque moteur une fois, puis découpe uniquement les validations futures."""
+    features = prepare_historical_features(history)
+    v1 = calculate_historical_timing_series(features, "Investisseur")
+    # Extraction sur la série complète : dates et espacement sont identiques au Timing Lab normal.
+    signals: dict[str, pd.DataFrame] = {}
+    if "V1" in engines:
+        signals["V1"] = extract_threshold_signals(v1, 70)
+    if "V2" in engines:
+        v2 = calculate_pullback_timing_series(features).reindex(v1.index)
+        signals["V2"] = extract_threshold_signals(v2, 70)
+    if {"V3 Early", "V3 Confirmed"}.intersection(engines):
+        v3 = calculate_v3_timing_series(features).reindex(v1.index)
+        if "V3 Early" in engines:
+            signals["V3 Early"] = extract_v3_signals(v3, "early")
+        if "V3 Confirmed" in engines:
+            signals["V3 Confirmed"] = extract_v3_signals(v3, "confirmed")
+    rows = []
+    for window in windows:
+        baseline = _bounded_window_statistics(v1, v1, window["validation_start"], window["validation_end"])
+        for engine in engines:
+            stats = _bounded_window_statistics(signals[engine], v1,
+                                               window["validation_start"], window["validation_end"])
+            for horizon in BACKTEST_HORIZONS:
+                item, base = stats[horizon], baseline[horizon]
+                rows.append({
+                    "Ticker": ticker, "Fenêtre": window["window"],
+                    "Début validation": window["validation_start"], "Fin validation": window["validation_end"],
+                    "Moteur": engine, "Horizon": horizon, "Signaux": item["observations"],
+                    "Performance moyenne": item["mean"], "Médiane": item["median"],
+                    "% positifs": item["positive"], "Baseline": base["mean"],
+                    "Alpha": calculate_alpha(item["mean"], base["mean"]),
+                    "Alpha médian": calculate_alpha(item["median"], base["median"]),
+                    "Drawdown": item["drawdown_mean"], "Pire drawdown": item["drawdown_worst"],
+                    "Drawdown baseline": base["drawdown_mean"],
+                })
+    return rows
+
+
+def aggregate_walk_forward(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    """Distingue moyenne par fenêtre, médiane et moyenne pondérée par observations."""
+    frame, output = pd.DataFrame(rows), []
+    if frame.empty:
+        return pd.DataFrame()
+    for (engine, horizon), group in frame.groupby(["Moteur", "Horizon"], sort=False):
+        valid = group.dropna(subset=["Alpha"])
+        weights = valid["Signaux"].clip(lower=0)
+        output.append({"Moteur": engine, "Horizon": horizon, "Alpha moyen": valid["Alpha"].mean(),
+                       "Alpha médian": valid["Alpha"].median(),
+                       "Alpha pondéré": ((valid["Alpha"] * weights).sum() / weights.sum()
+                                           if weights.sum() else None),
+                       "Fenêtres positives": int((valid["Alpha"] > 0).sum()),
+                       "Fenêtres valides": len(valid), "Observations": int(valid["Signaux"].sum())})
+    return pd.DataFrame(output)
+
+
+def walk_forward_robustness(summary: dict[str, Any], ticker_positive_ratio: float,
+                            drawdown_ok: bool) -> str:
+    enough = summary.get("Observations", 0) >= 30 and summary.get("Fenêtres valides", 0) >= 2
+    positive_windows = (summary.get("Fenêtres positives", 0) / summary.get("Fenêtres valides", 1)) > .5
+    encouraging = (valid_number(summary.get("Alpha moyen")) and summary["Alpha moyen"] > 0 and
+                   valid_number(summary.get("Alpha médian")) and summary["Alpha médian"] > 0 and
+                   positive_windows and ticker_positive_ratio > .5 and enough and drawdown_ok)
+    if encouraging:
+        return "Encourageante"
+    if not valid_number(summary.get("Alpha moyen")) or summary.get("Alpha moyen", 0) <= 0:
+        return "Faible"
+    return "Mitigée"
+
+
+def build_walk_forward_interpretation(engine: str, summary: dict[str, Any]) -> str:
+    """Produit une lecture descriptive déterministe, sans vocabulaire prédictif."""
+    valid, positive = summary.get("Fenêtres valides", 0), summary.get("Fenêtres positives", 0)
+    if valid_number(summary.get("Alpha moyen")) and summary["Alpha moyen"] > 0 and positive > valid / 2:
+        return (f"{engine} conserve un alpha moyen positif sur les fenêtres futures et reste positif sur "
+                "la majorité des périodes testées. Le résultat reste historique et ne garantit pas les performances futures.")
+    return (f"{engine} ne conserve pas d'avantage temporel stable : l'alpha moyen est négatif ou nul, "
+            "ou la majorité des fenêtres ne battent pas la baseline.")
+
+
 def split_validation_universes(conception: list[str], validation: list[str],
                                limit: int = 20) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Déduplique les univers et retire systématiquement leur chevauchement."""
@@ -1216,6 +1399,12 @@ def split_validation_universes(conception: list[str], validation: list[str],
     designed_set = set(designed)
     return tuple(symbol for symbol in candidates if symbol not in designed_set), \
         tuple(symbol for symbol in candidates if symbol in designed_set)
+
+
+def timing_oos_signature(effective: tuple[str, ...], period: str,
+                         threshold1: int, threshold2: int) -> tuple[tuple[str, ...], str, int, int]:
+    """Construit une signature immuable et stable entre calcul et rendu Streamlit."""
+    return tuple(effective), str(period), int(threshold1), int(threshold2)
 
 
 def aggregate_out_of_sample(raw_stats: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1533,6 +1722,27 @@ def aggregate_unconfirmed_v3_alpha(raw_stats: list[dict[str, Any]]) -> dict[str,
     return {"alpha_mean": values.mean() if len(values) else None,
             "alpha_median": values.median() if len(values) else None,
             "assets": len(values)}
+def aggregate_unconfirmed_v3_alpha(raw_stats: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    """Agrège les setups non confirmés en calculant d'abord l'alpha de chaque ticker."""
+    aggregated: dict[int, dict[str, Any]] = {}
+    for horizon in BACKTEST_HORIZONS:
+        ticker_rows = []
+        for item in raw_stats:
+            stats = item.get("v3_unconfirmed", {}).get(horizon, {})
+            baseline = item.get("baseline", {}).get(horizon, {})
+            alpha = calculate_alpha(stats.get("mean"), baseline.get("mean"))
+            if valid_number(alpha):
+                ticker_rows.append((float(stats["mean"]), float(alpha), int(stats.get("observations", 0))))
+        observations = sum(row[2] for row in ticker_rows)
+        aggregated[horizon] = {
+            "performance_mean": (sum(row[0] * row[2] for row in ticker_rows) / observations
+                                 if observations else None),
+            "alpha_mean": pd.Series([row[1] for row in ticker_rows], dtype=float).mean()
+            if ticker_rows else None,
+            "assets": len(ticker_rows),
+            "observations": observations,
+        }
+    return aggregated
 
 
 def _render_out_of_sample_results(result: dict[str, Any]) -> None:
@@ -1541,7 +1751,10 @@ def _render_out_of_sample_results(result: dict[str, Any]) -> None:
     if ignored:
         st.warning(f"{len(ignored)} ticker(s) ignorés faute de données suffisantes : {', '.join(ignored)}.")
     if not raw_stats:
-        st.error("Aucun historique hors échantillon exploitable.")
+        st.error("❌ Aucun actif hors échantillon n'a pu être calculé.")
+        st.write(f"Historiques téléchargés : **{result.get('downloaded_count', 0)}**")
+        st.write(f"Actifs ignorés : **{len(ignored)}**")
+        st.write(f"Tickers ignorés : **{', '.join(ignored) if ignored else 'Aucun'}**")
         return
     valid_assets = len(raw_stats)
     if valid_assets < 5:
@@ -1684,6 +1897,7 @@ def _render_out_of_sample_results(result: dict[str, Any]) -> None:
             unconfirmed_row["Alpha médian 20j"] = format_alpha(unconfirmed_alpha["alpha_median"])
             unconfirmed_row["Actions disponibles"] = unconfirmed_alpha["assets"]
             unconfirmed_row["Alpha 20j"] = format_alpha(calculate_alpha(mean, by_engine["V3 Early"][20]["baseline_mean"]))
+            unconfirmed_row["Alpha 20j"] = format_alpha(unconfirmed_alpha[horizon]["alpha_mean"])
     st.dataframe(pd.DataFrame([unconfirmed_row]), use_container_width=True, hide_index=True)
 
     st.markdown("#### Synthèse complète")
@@ -1739,6 +1953,113 @@ def _render_out_of_sample_results(result: dict[str, Any]) -> None:
     st.download_button("⬇️ Exporter la validation hors échantillon", export.to_csv(index=False).encode("utf-8"),
                        "timing_out_of_sample_validation.csv", "text/csv")
     st.info("Validation descriptive uniquement : aucune règle, aucun seuil et aucun ticker n'ont été optimisés.")
+
+def render_walk_forward_validation() -> None:
+    """Interface du test temporel, sans entraînement ni sélection de paramètres."""
+    st.title("⏩ Walk-Forward Validation")
+    st.caption("Validation temporelle descriptive : les règles restent figées et seules les périodes futures sont mesurées.")
+    st.info("Aucun ré-entraînement, grid search ou ajustement automatique de seuil n'est effectué.")
+    tickers_text = st.text_area("Tickers", "AAPL\nMSFT\nGOOGL\nNVDA\nJPM\nXOM\nKO\nSPY", key="wf_tickers")
+    tickers = tuple(parse_custom_tickers(tickers_text, limit=20))
+    c1, c2, c3, c4 = st.columns(4)
+    period_label = c1.selectbox("Période totale", ["3 ans", "5 ans"], index=1, key="wf_period")
+    observation = c2.number_input("Durée observation (ans)", 1, 5, 3, key="wf_observation")
+    validation = c3.number_input("Durée validation (ans)", 1, 3, 1, key="wf_validation")
+    step = c4.number_input("Step (ans)", 1, 3, 1, key="wf_step")
+    engines = tuple(st.multiselect("Moteurs à comparer", ["V1", "V2", "V3 Early", "V3 Confirmed"],
+                                     default=["V1", "V2", "V3 Early", "V3 Confirmed"], key="wf_engines"))
+    signature = (tickers, period_label, int(observation), int(validation), int(step), engines)
+    clicked = st.button("⏩ Lancer le walk-forward", type="primary", disabled=not tickers or not engines)
+    if clicked:
+        progress = st.progress(0, text="1/3 chargement")
+        started = perf_counter()
+        try:
+            histories = load_timing_lab_histories(tickers, "5y" if period_label == "5 ans" else "3y")
+            loaded_at = perf_counter()
+            progress.progress(34, text="2/3 calcul moteurs")
+            rows, window_count = [], 0
+            for number, ticker in enumerate(tickers, 1):
+                progress.progress(34 + int(55 * (number - 1) / len(tickers)),
+                                  text=f"2/3 calcul moteurs · Ticker {number} / {len(tickers)}")
+                history = histories.get(ticker, pd.DataFrame())
+                if history.empty:
+                    st.warning(f"{ticker} : historique indisponible.")
+                    continue
+                analysis_start = history.attrs.get("analysis_start", history.index.min())
+                windows = build_walk_forward_windows(analysis_start, history.index.max(), int(observation),
+                                                     int(validation), int(step))
+                window_count = max(window_count, len(windows))
+                rows.extend(calculate_walk_forward(history, ticker, windows, engines))
+            calculated_at = perf_counter()
+            progress.progress(90, text="3/3 agrégation walk-forward")
+            summary = aggregate_walk_forward(rows)
+            st.session_state["walk_forward_result"] = {
+                "signature": signature, "rows": rows, "summary": summary,
+                "timings": {"chargement": loaded_at - started, "moteurs": calculated_at - loaded_at,
+                            "agrégation": perf_counter() - calculated_at, "total": perf_counter() - started},
+                "windows": window_count,
+            }
+            progress.progress(100, text="3/3 agrégation walk-forward · terminé")
+        except Exception as exc:
+            st.error("Le walk-forward a échoué.")
+            st.exception(exc)
+    stored = st.session_state.get("walk_forward_result")
+    if not stored or stored.get("signature") != signature:
+        if stored:
+            st.info("Les paramètres ont changé. Relancez le walk-forward.")
+        return
+    rows, summary = stored["rows"], stored["summary"]
+    if not rows or summary.empty:
+        st.warning("Aucune fenêtre complète n'est disponible avec ces paramètres.")
+        return
+    frame = pd.DataFrame(rows)
+    main = frame[(frame["Horizon"] == 20) & frame["Alpha"].notna()].copy()
+    main["Fenêtre / Moteur"] = main["Fenêtre"] + " · " + main["Moteur"]
+    for column in ("Alpha", "Alpha médian", "% positifs", "Drawdown"):
+        main[column] = main[column].map(format_percentage)
+    st.subheader("Résultats par fenêtre — 20 séances")
+    st.dataframe(main[["Ticker", "Fenêtre / Moteur", "Alpha", "Alpha médian", "Signaux", "% positifs", "Drawdown"]],
+                 use_container_width=True, hide_index=True)
+    s20 = summary[summary["Horizon"] == 20].copy()
+    for column in ("Alpha moyen", "Alpha médian", "Alpha pondéré"):
+        s20[column] = s20[column].map(format_percentage)
+    s20["Fenêtres alpha +"] = s20["Fenêtres positives"].astype(str) + " / " + s20["Fenêtres valides"].astype(str)
+    st.subheader("Stabilité dans le temps et alpha walk-forward")
+    st.dataframe(s20[["Moteur", "Alpha moyen", "Alpha médian", "Alpha pondéré", "Fenêtres alpha +", "Observations"]],
+                 use_container_width=True, hide_index=True)
+    ticker_rows = []
+    for (ticker, engine), group in main.groupby(["Ticker", "Moteur"]):
+        numeric = frame[(frame["Ticker"] == ticker) & (frame["Moteur"] == engine) &
+                        (frame["Horizon"] == 20)].dropna(subset=["Alpha"])
+        ticker_rows.append({"Ticker": ticker, "Moteur": engine, "Fenêtres valides": len(numeric),
+                            "Alpha moyen 20j": format_percentage(numeric["Alpha"].mean()),
+                            "Fenêtres alpha +": f"{int((numeric['Alpha'] > 0).sum())} / {len(numeric)}"})
+    st.subheader("Stabilité par action")
+    st.dataframe(pd.DataFrame(ticker_rows), use_container_width=True, hide_index=True)
+    comparison = summary.pivot(index="Moteur", columns="Horizon", values="Alpha moyen").reset_index()
+    comparison = comparison.rename(columns={5: "Alpha moy. 5j", 20: "Alpha moy. 20j", 60: "Alpha moy. 60j"})
+    comparison = comparison.merge(summary[summary["Horizon"] == 20][["Moteur", "Fenêtres positives", "Fenêtres valides"]], on="Moteur")
+    comparison["Fenêtres alpha + 20j"] = comparison["Fenêtres positives"].astype(str) + " / " + comparison["Fenêtres valides"].astype(str)
+    for column in ("Alpha moy. 5j", "Alpha moy. 20j", "Alpha moy. 60j"):
+        comparison[column] = comparison[column].map(format_percentage)
+    st.subheader("Comparaison des moteurs")
+    st.dataframe(comparison[["Moteur", "Alpha moy. 5j", "Alpha moy. 20j", "Alpha moy. 60j", "Fenêtres alpha + 20j"]],
+                 use_container_width=True, hide_index=True)
+    for _, item in summary[summary["Horizon"] == 20].iterrows():
+        ticker_means = frame[(frame["Moteur"] == item["Moteur"]) & (frame["Horizon"] == 20)].groupby("Ticker")["Alpha"].mean().dropna()
+        ratio = (ticker_means > 0).mean() if len(ticker_means) else 0
+        engine_rows = frame[(frame["Moteur"] == item["Moteur"]) & (frame["Horizon"] == 20)]
+        dd_ok = not ((engine_rows["Drawdown"] < engine_rows["Drawdown baseline"] - .03).mean() > .5)
+        st.markdown(f"**{item['Moteur']} — Robustesse {walk_forward_robustness(item.to_dict(), ratio, dd_ok)}**")
+        st.caption(build_walk_forward_interpretation(item["Moteur"], item.to_dict()))
+    timings = stored["timings"]
+    st.caption(f"Temps : chargement {timings['chargement']:.2f}s · moteurs {timings['moteurs']:.2f}s · "
+               f"agrégation {timings['agrégation']:.2f}s · total {timings['total']:.2f}s")
+    export_columns = ["Ticker", "Fenêtre", "Début validation", "Fin validation", "Moteur", "Horizon", "Signaux",
+                      "Performance moyenne", "Médiane", "Baseline", "Alpha", "Drawdown"]
+    st.download_button("⬇️ Exporter les résultats walk-forward", frame[export_columns].to_csv(index=False).encode("utf-8"),
+                       "walk_forward_validation.csv", "text/csv")
+
 
 def render_timing_lab() -> None:
     """Interface expérimentale comparant V1 et V2 inchangées à V3."""
@@ -1898,21 +2219,48 @@ def render_timing_lab() -> None:
     oos_v2 = oc3.slider("Seuil V2 figé", 40, 90, 70, key="lab_oos_v2")
     st.caption(f"Espacement minimum inchangé : {MIN_SIGNAL_GAP} séances · Horizons : 5 / 20 / 60 séances · "
                "Aucun ajustement automatique par ticker.")
-    signature = (effective, periods[oos_period_label], oos_v1, oos_v2)
-    if st.button("🧪 Lancer la validation hors échantillon", type="primary", disabled=not effective):
-        with st.spinner("Validation causale groupée en cours…"):
+    signature = timing_oos_signature(effective, periods[oos_period_label], oos_v1, oos_v2)
+    validation_clicked = st.button(
+        "🧪 Lancer la validation hors échantillon", type="primary", disabled=not effective)
+    if validation_clicked:
+        progress = st.progress(0, text="1/4 Téléchargement des historiques")
+        try:
             all_tickers = tuple(dict.fromkeys((*conception, *effective)))
             histories = load_timing_lab_histories(all_tickers, periods[oos_period_label])
+            missing_histories = [ticker for ticker in all_tickers if ticker not in histories]
+            st.write(f"Historiques chargés : **{len(histories)} / {len(all_tickers)}**")
+            if missing_histories:
+                st.warning(f"Historiques absents : {', '.join(missing_histories)}.")
+            progress.progress(25, text=f"2/4 Calcul des {len(effective)} actions hors échantillon")
             validation_stats, ignored = _calculate_validation_assets(effective, histories, oos_v1, oos_v2)
-            conception_stats, _ = _calculate_validation_assets(tuple(conception), histories, oos_v1, oos_v2)
+            progress.progress(50, text="3/4 Calcul de l'univers de conception")
+            conception_stats, conception_ignored = _calculate_validation_assets(
+                tuple(conception), histories, oos_v1, oos_v2)
             st.session_state["timing_oos_result"] = {
                 "signature": signature, "validation": validation_stats, "conception": conception_stats,
                 "ignored": ignored,
+                "conception_ignored": conception_ignored,
+                "downloaded_count": len(histories), "requested_count": len(all_tickers),
+                "missing_histories": missing_histories,
             }
+            stored_after_calculation = st.session_state.get("timing_oos_result")
+            if not stored_after_calculation:
+                raise RuntimeError("Le résultat calculé n'a pas été conservé dans la session Streamlit.")
+            if stored_after_calculation.get("signature") != signature:
+                raise RuntimeError("La signature de validation a changé pendant le calcul.")
+            progress.progress(75, text="4/4 Rendu des résultats")
+            st.success(f"✅ Validation terminée — {len(validation_stats)} actifs hors échantillon analysés.")
+            _render_out_of_sample_results(stored_after_calculation)
+            progress.progress(100, text="4/4 Résultats prêts")
+        except Exception as exc:
+            st.error("La validation hors échantillon a échoué.")
+            st.exception(exc)
     stored = st.session_state.get("timing_oos_result")
-    if stored and stored.get("signature") == signature:
+    # Après un clic, le rendu (ou son erreur explicite) a déjà eu lieu dans le try.
+    if not validation_clicked and stored and stored.get("signature") == signature:
+        st.success(f"✅ Validation terminée — {len(stored.get('validation', []))} actifs hors échantillon analysés.")
         _render_out_of_sample_results(stored)
-    elif stored:
+    elif not validation_clicked and stored:
         st.info("Les paramètres ont changé. Relancez la validation pour obtenir des résultats comparables.")
     st.warning("Les règles V2 ont été définies avant observation de ce test. Ne modifiez pas immédiatement les seuils après chaque résultat : cela créerait un risque de sur-optimisation.")
     st.info("Une future étape consistera à figer la meilleure variante puis à la tester sur une période / un univers non utilisé lors de sa conception.")
@@ -3062,7 +3410,7 @@ if "analysis_ticker" not in st.session_state:
     st.session_state["analysis_ticker"] = "AAPL"
 with st.sidebar:
     navigation = st.radio(
-        "Mode", options=["📊 Analyse", "🥊 Comparateur", "🔎 Screener", "⭐ Watchlist", "🧪 Backtest", "🧬 Timing Lab"],
+        "Mode", options=["📊 Analyse", "🥊 Comparateur", "🔎 Screener", "⭐ Watchlist", "🧪 Backtest", "🧬 Timing Lab", "⏩ Walk-Forward Validation"],
         key="navigation_mode",
     )
     st.header("Paramètres d'analyse")
@@ -3111,5 +3459,7 @@ elif navigation == "⭐ Watchlist":
     render_watchlist(selected_mode)
 elif navigation == "🧪 Backtest":
     render_backtest()
-else:
+elif navigation == "🧬 Timing Lab":
     render_timing_lab()
+else:
+    render_walk_forward_validation()
